@@ -1,0 +1,17 @@
+{
+    "cmake.sourceDirectory": "/home/chenyan/demo/mac80211_hwsim_mgmt-master",
+    "files.associations": {
+        "netlink.h": "c",
+        "wserver_messages_network.h": "c",
+        "wserver_messages.h": "c",
+        "timerfd.h": "c",
+        "errno.h": "c",
+        "iostream": "cpp"
+    },
+    "search.useIgnoreFiles": false,
+    "github.copilot.chat.editor.temporalContext.enabled": true,
+    "github.copilot.chat.edits.temporalContext.enabled": true,
+    "editor.fontLigatures": false,
+    "terminal.intergreted.fontFamily": "'Courier New',console",
+    
+}

@@ -1,0 +1,5 @@
+*.o
+wmediumd/wmediumd
+tests/client_snr
+tests/client_errprob
+tests/client_specprob
