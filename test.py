@@ -40,17 +40,6 @@ Net_1.plot_all_nodes()
 print(times)
 
 
-
-# w_server.connect()
-# sta3 = Interface(id="33",name="sta3", mac="02:00:00:00:03:00")
-# sta4 = Interface(id="44",name="sta4", mac="02:00:00:00:04:00")
-# print("Registering interfaces...")
-# sta1_id = w_server.register_interface(sta3.get_mac())
-# sta2_id = w_server.register_interface(sta4.get_mac())
-# print(f"Registered interfaces with IDs: {sta1_id}, {sta2_id}")
-
-
-
 # Net_1.select_core_nodes()
 Net_1.end_test()
 
