@@ -1,4 +1,3 @@
-
 import docker
 import sys
 import os
@@ -12,6 +11,13 @@ from Wirelesslink import wlsintf
 from wmediumdConnector import WStarter, w_server, WmediumdException,w_gain, SNRLink, ERRPROBLink, w_pos, w_txpower
 from dqn_agent import DQNAgent
 nodes=[]
+
+# 找到 self.nodes 列表的辅助函数
+def get_node_by_mac(mac):
+    for node in nodes:
+        if node.mac == mac:
+            return node
+    return None
 
 class Node(object):
     portBase = 0
@@ -50,7 +56,6 @@ class Node(object):
         return docker.from_env().containers.get(self.name)
 
     # 创建相应的namespace
-
     def create_netns(self):
         node_name = self.name
         if not (os.path.exists("/var/run/netns/" + node_name)):
@@ -255,14 +260,15 @@ class Node(object):
     
     def get_rssi(self , macs):
           # 2. 获取 RSSI、bitrate 等
-        rssi= -100  # 默认值
-        bitrate = 0  # 默认值
         wlan_name = f"wlan{self.name}"
         station_dump = self.cmd(f"iw dev {wlan_name} station dump")
         stats={}
         count=station_dump.count('Station ')
-        found = False
+        
         for mac in macs:
+            rssi= -100  # 默认值
+            bitrate = 0  # 默认值
+            found = False
             
             for block in station_dump.split('Station '):
                 if mac.lower() in block.lower():
@@ -280,32 +286,57 @@ class Node(object):
                                 pass 
                     stats[mac] = {'rssi': rssi, 'bitrate': bitrate}    
                     break
-            if found:
-                for record in reversed(self.link_quality_history):
-                    if record.get('mac') == mac.lower():
+            
+            # <--- MODIFIED: 确保即使没找到MAC，也更新历史记录 ---_>
+            # 在 fping 之后，我们总是有一个历史记录条目
+            # 我们需要找到它并更新它
+            for record in reversed(self.link_quality_history):
+                if record.get('mac') == mac.lower():
+                    # 仅在 fping 成功后才更新（即 latency 不是默认值）
+                    if record.get('latency', 9999) != 9999:
                         record['rssi'] = rssi
                         record['bitrate'] = bitrate
-                        break
-        print(f"节点 {self.name} 的 station dump 中找到 {count} 个 MAC 地址的信息")
+                    break
+                    
+        # print(f"节点 {self.name} 的 station dump 中找到 {count} 个 MAC 地址的信息")
         if not found:
-            print(f"未在 {wlan_name} 的 station dump 中找到 \n {macs} 的信息")
+            pass # print(f"未在 {wlan_name} 的 station dump 中找到 {macs} 的信息")
             
         
         
     def get_latency(self,target_ips, count=5):
         time1= time.time()
-        ips = ' '.join(target_ips)
-        cmd = f"fping -c {count} -q {ips} -t 100 -p 1"
+        ips_str = ' '.join(target_ips)
+        cmd = f"fping -c {count} -q {ips_str} -t 100 -p 1"
         result = self.cmd(cmd)
-        print(f"节点 {self.name} 的 fping 结果:\n {result}")
+        # print(f"节点 {self.name} 的 fping 结果:\n {result}")
         stats = {}
+        
+        # <--- MODIFIED: 预先为所有 target_ips 创建历史条目 ---_>
+        # 这样 get_rssi 就能找到对应的条目
+        ip_to_mac_map = {node.ip.split('/')[0]: node.mac for node in nodes if node.ip.split('/')[0] in target_ips}
+        
+        for ip in target_ips:
+            stats[ip] = {'loss': 100.0, 'avg_latency': 9999.0} # 默认值
+            # 添加/更新历史记录
+            self.link_quality_history.append({
+                'target': get_node_by_mac(ip_to_mac_map[ip]).name if ip in ip_to_mac_map else 'unknown',
+                'mac': ip_to_mac_map.get(ip, 'unknown'),
+                'ip': ip,
+                'time': time.time(),
+                'rssi': -100,
+                'bitrate': 0,
+                'loss': 100.0,
+                'latency': 9999.0,
+            })
+
         for line in result.splitlines():
             m = re.match(r'(\S+) : xmt/rcv/%loss = (\d+)/(\d+)/([\d\.]+)%, min/avg/max = ([\d\.]+)/([\d\.]+)/([\d\.]+)', line)
             if m:
                 ip = m.group(1)
                 loss = float(m.group(4))
                 if loss == 100.0:
-                    avg = float('inf')
+                    avg = 9999.0 # 使用一个大的有限值
                 else : 
                     avg = float(m.group(6))
                 stats[ip] = {'loss': loss, 'avg_latency': avg}
@@ -316,10 +347,51 @@ class Node(object):
                     record['latency'] = stat['avg_latency']
                     record['loss'] = stat['loss']
                     break
-        # print(f"节点 {self.name} 的 fping 结果: {stats}")
-        time2= time.time()
-        print(f"节点 {self.name} 的 fping 耗时: {time2-time1:.2f}秒")
+                    
+        # time2= time.time()
+        # print(f"节点 {self.name} 的 fping 耗时: {time2-time1:.2f}秒")
         return stats
+
+    # <--- MODIFIED: 新增函数，用于构建完整的状态向量 ---_>
+    def get_link_quality_by_mac(self, target_mac):
+        """
+        获取到特定MAC的完整链路质量，用于状态向量。
+        """
+        target_node = get_node_by_mac(target_mac)
+        if not target_node:
+            return None
+
+        # 1. 从历史记录中查找最新的 延迟/丢包/RSSI
+        latest_record = None
+        for record in reversed(self.link_quality_history):
+            if record.get('mac') == target_mac:
+                latest_record = record
+                break
+        
+        # 2. 实时计算物理信息
+        distance = self.get_distance(target_node)
+        doppler_shift, signal_impact = self.calculate_siganal_impact(target_node)
+        
+        if latest_record:
+            return {
+                'distance': distance,
+                'latency': latest_record.get('latency', 9999.0),
+                'loss': latest_record.get('loss', 100.0),
+                'rssi': latest_record.get('rssi', -100.0),
+                'bitrate': latest_record.get('bitrate', 0.0),
+                'doppler_shift': doppler_shift
+            }
+        else:
+            # 如果历史记录中没有 (例如，第一次运行)
+            return {
+                'distance': distance,
+                'latency': 9999.0,
+                'loss': 100.0,
+                'rssi': -100.0,
+                'bitrate': 0.0,
+                'doppler_shift': doppler_shift
+            }
+
     
     def get_neighbor(self):
         # 获取邻居信息
@@ -342,4 +414,5 @@ class Node(object):
     #     cmd_2=self.cmd(f"ovs-vsctl show")
     #     print(cmd_2)
     
+
 
