@@ -127,6 +127,7 @@ class Net:
             direction=node.direction,
             txpower=node.txpower
             )
+        self.node_dict[name]=node # <--- MODIFIED: 更新节点映射 ---_>
         
     @classmethod
     def reset_node_ids(cls):
@@ -714,10 +715,14 @@ class Net:
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path)
+            print(f"图已保存到: {save_path}")
         else:
             # 确保 test 目录存在
             subprocess.run(["mkdir", "-p", "test"])
             plt.savefig(f"test/{src_node_name} -> {target_node_name} link quality.png")
+            output_path=f"test/{src_node_name} -> {target_node_name} link quality.png"
+            plt.savefig(output_path)
+            print(f"图已保存到: {output_path}")
         plt.close() 
             
     def plot_all_nodes(self):
@@ -784,6 +789,13 @@ class Net:
         
         for node_name, task in tasks.items():
             node = self.node_dict[node_name]
+           # 优先从映射取节点，若不存在则回退到遍历 self.nodes 查找，避免 KeyError
+            node = self.node_dict.get(node_name)
+            if node is None:
+               node = next((n for n in self.nodes if n.name == node_name), None)
+            if node is None:
+                 print(f"[WARN] 未找到节点对象: {node_name}, 跳过该任务")
+                 continue
             t = threading.Thread(target=node_task, args=(node, task['ips'], task['macs']))
             threads.append(t)  
             t.start()
