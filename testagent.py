@@ -9,11 +9,12 @@ import matplotlib.pyplot as plt # <--- MODIFIED: 导入 matplotlib
 Net_1 = Net(name='Net_1', interval=1) # 1秒一个时间步
 Net_1.add_node(name="11", mac="02:00:00:00:01:00", ip="10.10.10.1/24",position= (140, 0, 0), direction=(-10, 0, 0))
 Net_1.add_node(name="12", mac="02:00:00:00:02:00", ip="10.10.10.2/24",position= (-140, 0, 0),direction= (10, 0, 0))
-Net_1.add_node(name="13", mac="02:00:00:00:03:00", ip="10.10.10.3/24",position=(-200, 0, 0),direction=(0, 0, 0))
-Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(250, 0, 30),(1, 1, 0))
-# Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 10))
-# Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(1,20,300),(10,10,1))
+Net_1.add_node(name="13", mac="02:00:00:00:03:00", ip="10.10.10.3/24",position=(-100, 0, 0),direction=(0, 0, 0))
+Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(150, 0, 30),(1, 1, 0))
+Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 10))
+Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(1,20,300),(10,10,1))
 # Net_1.add_node("17", "02:00:00:00:00:07","10.10.10.7/24",(10,20,30),(1,1,10))
+# docker stop 11&&docker rm 11&&docker stop 12&&docker rm 12&&docker stop 13&&docker rm 13&&docker stop 14&&docker rm 14
 
 
 # 2. 启动网络
@@ -33,12 +34,12 @@ try:
     node_11 = Net_1.node_dict["11"]
     
     # 在 17 上启动 iperf UDP 服务器
-    node_17.cmd("apt-get update && apt-get install -y iperf")
-    node_17.cmd("iperf -s -u &") 
+    # node_17.cmd("apt-get update && apt-get install -y iperf")
+    node_17.cmd("iperf3 -s -u &") 
     
     # 在 11 上启动 iperf UDP 客户端
     # node_11.cmd("apt-get update && apt-get install -y iperf")
-    node_11.cmd(f"iperf -c {node_17.ip.split('/')[0]} -u -b 1m -t 300 &") 
+    node_11.cmd(f"iperf3 -c {node_17.ip.split('/')[0]} -u -b 1m -t 300 &") 
     print(f"已启动从 {node_11.name} 到 {node_17.name} 的 1Mbps UDP 流量")
 except Exception as e:
     print(f"启动 iperf 失败: {e}")
@@ -48,7 +49,7 @@ except Exception as e:
 print("=== 智能路由训练与测试开始 ===")
 times={}
 time_all=time.time()
-training_steps = 5 # <--- MODIFIED: 定义训练步数
+training_steps = 15 # <--- MODIFIED: 定义训练步数
 
 # <--- MODIFIED: 5. 更改为主训练/仿真循环 ---_>
 for i in range(training_steps): 

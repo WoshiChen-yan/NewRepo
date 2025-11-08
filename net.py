@@ -33,17 +33,18 @@ class Net:
          self.core_nodes=[]#用于存储核心节点
          self.node_agents={}#用于存储核心节点的智能体
          
-         # <--- MODIFIED: 为 GRU 添加状态历史管理 ---_>
+         # <--- 为 GRU 添加状态历史管理 ---_>
          self.node_states={} # 存储节点 {name: state_vector} 的最新状态
          self.state_history = {} # 存储 {name: deque([state_vector, ...], maxlen=seq_len)}
-         self.seq_len = 5 # <--- MODIFIED: 定义GRU要看的时间序列长度
-         self.state_dim = 0 # <--- MODIFIED: 将在 select_core_nodes 中设置
-         self.num_dests = 0 # <--- MODIFIED: 将在 select_core_nodes 中设置
-         self.num_next_hops = 0 # <--- MODIFIED: 将在 select_core_nodes 中设置
-         self.gru_hidden_dim = 64 # <--- MODIFIED: GRU 隐藏层大小
-         self.node_dict = {} # <--- MODIFIED: 方便按名称查找节点
-         self.reward_history = {} # <--- MODIFIED: 存储奖励历史用于绘图
-         # <--- MODIFIED 结束 ---_>
+         self.seq_len = 5 # <---  定义GRU要看的时间序列长度
+         self.state_dim = 0 # <---  将在 select_core_nodes 中设置
+         self.num_dests = 0 # <---  将在 select_core_nodes 中设置
+         self.num_next_hops = 0 # <---  将在 select_core_nodes 中设置
+         self.gru_hidden_dim = 64 # <--- GRU 隐藏层大小
+         self.node_dict = {} # <--- 方便按名称查找节点
+         self.reward_history = {} # <--- 存储奖励历史用于绘图
+         self.batch_size = 32  # 收集32个时间步的数据后再学习
+         self.global_steps = 0 # 全局时间步计数器
 
          self.graph=nx.Graph(name=self.name)
          self.dqn_initialized=False
@@ -157,7 +158,7 @@ class Net:
             print(f"节点'{node.name}'位置已更新为: {node.position}")
          
     
-    # <--- MODIFIED: 重命名为 _get_current_state_vector，并使用 node.py 的新函数 ---_>
+    
     def _get_current_state_vector(self, node):
         """获取节点 *当前* 的状态向量"""
         state_vector = []
@@ -191,7 +192,7 @@ class Net:
         self.node_states[node.name] = state_vector
         return state_vector
 
-    # <--- MODIFIED: 新增函数，用于管理和返回 GRU 所需的状态序列 ---_>
+    # 新增函数，用于管理和返回 GRU 所需的状态序列 ---_>
     def get_state_sequence(self, node_name):
         """获取并更新节点的状态历史序列，用于GRU"""
         
@@ -212,6 +213,8 @@ class Net:
 
 
     def compute_node_reward(self, node):
+        
+
         """计算指定节点的奖励"""
         # (这是一个简化的奖励。在实际中，您应该基于流量生成器 (项目3)
         # 测量的真实端到端延迟和吞吐量来计算奖励)
@@ -234,63 +237,111 @@ class Net:
             return -10.0 # 如果没有链路信息，给予惩罚
             
         return sum(link_qualities) / len(link_qualities)
-    
-    # <--- MODIFIED: 重写 update_routing 作为 PPO 的训练步骤 ---_>
+    # <--- MODIFIED: 新增函数，根据链路质量计算奖励值 ---_>
+    def _calculate_reward_from_link(self, link_info):
+        """根据单个链路信息计算奖励 (0-10)"""
+        if not link_info:
+            return -10.0 # 惩罚不存在的链路
+        
+        # 奖励 = 10 - 延迟惩罚 - 丢包惩罚
+        # 目标: 延迟 < 20ms, 丢包 = 0%
+        
+        latency = min(link_info.get('latency', 100.0), 100.0)
+        loss = min(link_info.get('loss', 100.0), 100.0)
+        
+        # 延迟惩罚 (0-5分): 延迟 100ms 扣 5 分
+        lat_penalty = (latency / 100.0) * 5.0
+        # 丢包惩罚 (0-5分): 丢包 100% 扣 5 分
+        loss_penalty = (loss / 100.0) * 5.0
+        
+        # 基础奖励 10 分
+        reward = 10.0 - lat_penalty - loss_penalty
+        
+        # 对极差的链路（例如 fping 失败）施加额外惩罚
+        if latency >= 9999.0 or loss == 100.0:
+            return -5.0
+            
+        return reward
+    # 重写 update_routing 作为 PPO 的训练步骤 ---_>
+    # <--- MODIFIED: 重写 update_routing 以实现正确的奖励和学习循环 ---_>
     def update_routing(self):
         """
         为所有核心节点执行一个完整的 RL 步骤:
-        获取状态 -> 选择动作 -> 执行动作 -> 获取新状态 -> 存储经验 -> 学习
+        获取状态 -> 选择动作 -> 执行动作 -> 获取新状态 -> 存储经验 -> (等待) -> 学习
         """
         
-        # 1. (可选) 确保所有节点的链路信息都是最新的
-        # self.test_all_links_concurrent() # test.py 中的循环已经调用了它
-
-        # 2. 遍历所有核心节点智能体
-        for core_node in self.core_nodes:
+        # 1. 遍历所有核心节点智能体
+        for node_index, core_node in enumerate(self.nodes): # 使用 enumerate 获取索引
+            
+            # (假设所有节点都是核心节点，如果不是，您需要调整这里的逻辑)
             agent = self.node_agents.get(core_node.name)
             if not agent:
-                print(f"错误: 核心节点 {core_node.name} 没有找到智能体")
+                print(f"错误: 节点 {core_node.name} 没有找到智能体")
                 continue
 
-            # 3. 获取状态 (时序)
+            # 2. 获取状态 (时序)
             state_seq = self.get_state_sequence(core_node.name)
             
-            # 4. 智能体选择动作 (主/备路径)
-            # actions: [num_dests, 2], logprobs: [num_dests, 2]
-            actions, old_logprobs = agent.select_action(state_seq)
+            # 3. 智能体选择动作 (主/备路径)
+            # <--- MODIFIED: 传入 self_index 用于掩码 ---_>
+            actions, old_logprobs = agent.select_action(state_seq, node_index)
             
-            # 5. 在环境中执行动作 (下发路由)
+            # 4. 在环境中执行动作 (下发路由)
             self.apply_node_routing(core_node, actions)
             
-            # 6. 获取执行动作后的新状态和奖励
-            # (注意：在真实环境中，新状态和奖励应该在动作执行 *之后* 测量)
-            # (为简单起见，我们假设移动和链路更新已经发生)
+            # 5. 获取执行动作后的新状态
             new_state_seq = self.get_state_sequence(core_node.name)
-            reward = self.compute_node_reward(core_node)
-            done = False # 在持续任务中，done 始终为 False
+
+            # 6. <--- MODIFIED: 计算 *与动作相关* 的奖励 ---_>
+            total_reward_for_step = 0
+            valid_dests = 0
             
-            # <--- MODIFIED: 记录奖励 ---_>
+            for dest_index in range(self.num_dests):
+                if dest_index == node_index: # 跳过到自己的路由
+                    continue
+                
+                primary_hop_index = actions[dest_index][0]
+                backup_hop_index = actions[dest_index][1]
+                
+                primary_hop_node = self.nodes[primary_hop_index]
+                backup_hop_node = self.nodes[backup_hop_index]
+                
+                # 获取所选路径的链路质量
+                link_info_p = core_node.get_link_quality_by_mac(primary_hop_node.mac)
+                link_info_b = core_node.get_link_quality_by_mac(backup_hop_node.mac)
+                
+                # 计算奖励
+                r_p = self._calculate_reward_from_link(link_info_p)
+                r_b = self._calculate_reward_from_link(link_info_b)
+                
+                # 备用路径的奖励权重为 0.5
+                total_reward_for_step += (r_p + r_b * 0.5)
+                valid_dests += 1
+            
+            # 计算此时间步的平均奖励
+            reward = total_reward_for_step / valid_dests if valid_dests > 0 else 0
+            done = False 
+            
+            # 7. <--- MODIFIED: 记录这个 *真实的* 动作奖励用于绘图 ---_>
             if core_node.name not in self.reward_history:
                 self.reward_history[core_node.name] = []
             self.reward_history[core_node.name].append(reward)
-            # <--- MODIFIED 结束 ---_>
-
-
-            # 7. 存储经验
-            # transition = (state, action, reward, next_state, old_logprob, done)
-            agent.store((state_seq, actions, reward, new_state_seq, old_logprobs, done))
             
-            # 8. 触发智能体学习
-            # (PPO 标准: 收集N步后再学习)
-            # 我们在 ppo_agent.py 中设置了 memory.clear()，
-            # 所以这里每次调用 learn() 都是 on-policy 的 (使用刚收集到的1个样本)
-            # 为了更高效，我们应该收集
-            if len(agent.memory) >= 32: # 举例: 收集到32个经验后再学习
-                agent.learn(batch_size=32)
+            # 8. 存储经验
+            agent.store((state_seq, actions, reward, new_state_seq, old_logprobs, done))
         
-             
+        # --- 9. <--- MODIFIED: 全局学习步骤 ---_>
+        self.global_steps += 1
+        
+        # 当收集到足够的数据时 (例如 32 个时间步)
+        if self.global_steps % self.batch_size == 0:
+            print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+            # 触发 *所有* 智能体学习
+            for agent in self.node_agents.values():
+                agent.learn() # PPO 智能体将使用它收集到的所有数据，然后清空内存
+            print("--- [学习步骤完成] ---\n")
     
-    # <--- MODIFIED: 重写 apply_node_routing 以处理复杂的“主/备”动作 ---_>
+    #  重写 apply_node_routing 以处理复杂的“主/备”动作 ---_>
     def apply_node_routing(self, core_node, actions):
         """
         应用核心节点的路由决策 (主/备路径)
@@ -329,6 +380,10 @@ class Net:
             dest_ip = dest_node.ip.split('/')[0]
             primary_hop_ip = primary_hop_node.ip.split('/')[0]
             backup_hop_ip = backup_hop_node.ip.split('/')[0]
+            # <--- MODIFIED: 检查无效的下一跳 (虽然掩码应该阻止了，但这是双重保险) ---_>
+            if primary_hop_ip == core_node.ip.split('/')[0]:
+                # print(f"  检测到无效的主路由 {core_node.name} -> {primary_hop_node.name} -> {dest_node.name}，跳过")
+                continue # 跳过无效路由
 
             # 下发主路由 (metric 10)
             # 使用 `ip route replace` 来原子性地替换或添加路由
@@ -451,7 +506,7 @@ class Net:
         pass
 
 
-    # <--- MODIFIED: 取消注释 select_core_nodes 并实现 PPOAgent 的创建 ---_>
+    # 取消注释 select_core_nodes 并实现 PPOAgent 的创建 ---_>
     def select_core_nodes(self, num_nodes_rate=0.3):
         """
         选择核心节点，并初始化共享的 Critic 和所有 PPO 智能体
