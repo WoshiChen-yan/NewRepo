@@ -33,18 +33,32 @@ class Net:
          self.core_nodes=[]#用于存储核心节点
          self.node_agents={}#用于存储核心节点的智能体
          
+          # --- 局部状态和动作空间 ---
+         self.MAX_NEIGHBORS = 10 # 假设每个节点最多有10个邻居 
+         self.state_dim = self.MAX_NEIGHBORS * 5 
+        
+        
+        
+         # --- 全局参数 ---
          # <--- 为 GRU 添加状态历史管理 ---_>
          self.node_states={} # 存储节点 {name: state_vector} 的最新状态
          self.state_history = {} # 存储 {name: deque([state_vector, ...], maxlen=seq_len)}
          self.seq_len = 5 # <---  定义GRU要看的时间序列长度
          self.state_dim = 0 # <---  将在 select_core_nodes 中设置
-         self.num_dests = 0 # <---  将在 select_core_nodes 中设置
-         self.num_next_hops = 0 # <---  将在 select_core_nodes 中设置
+         
+         
+         self.num_dests = 7 # <---  将在 select_core_nodes 中设置
+         self.num_next_hops = 7 # <---  将在 select_core_nodes 中设置
+         self.dest_embedding_dim = 16 
+         
+         
          self.gru_hidden_dim = 64 # <--- GRU 隐藏层大小
          self.node_dict = {} # <--- 方便按名称查找节点
+         
          self.reward_history = {} # <--- 存储奖励历史用于绘图
          self.batch_size = 32  # 收集32个时间步的数据后再学习
          self.global_steps = 0 # 全局时间步计数器
+         self.agent_migration_interval = 1 # 每1个时间步迁移一次智能体
 
          self.graph=nx.Graph(name=self.name)
          self.dqn_initialized=False
@@ -122,13 +136,15 @@ class Net:
         
         node=Node(id=node_id,name=name,mac=mac,ip=ip,position=position,direction=direction)
         self.nodes.append(node)
+        self.node_dict[name]=node # <--- MODIFIED: 更新节点映射 ---_>
+        
         self.graph.add_node(
             node.name,
             position=node.position,
             direction=node.direction,
             txpower=node.txpower
             )
-        self.node_dict[name]=node # <--- MODIFIED: 更新节点映射 ---_>
+        
         
     @classmethod
     def reset_node_ids(cls):
@@ -160,218 +176,224 @@ class Net:
     
     
     def _get_current_state_vector(self, node):
-        """获取节点 *当前* 的状态向量"""
         state_vector = []
         
-        # 1. 添加链路质量信息
-        # (我们假设 self.nodes 列表的顺序是固定的，用作目标/下一跳的索引)
+        # 1. 获取所有邻居的链路质量
+        all_links = []
         for target_node in self.nodes:
             if target_node == node:
                 continue
-                
-            # <--- MODIFIED: 使用 node.py 中新添加的函数 ---_>
-            link_info = node.get_link_quality_by_mac(target_node.mac) 
-            
+            link_info = node.get_link_quality_by_mac(target_node.mac)
             if link_info:
-                state_vector.extend([
-                    link_info['distance']/1000.0,
-                    link_info['latency']/100.0,
-                    link_info['loss']/100.0,
-                    link_info['rssi']/100.0,
-                    link_info['doppler_shift']/1000.0
-                ])
-            else:
-                # 如果没有数据 (不应该发生，但作为保险)
-                state_vector.extend([9.9, 99.9, 100.0, -100.0, 0.0])
-
-        # 2. (TODO) 添加队列状态
-        # queue_status = node.get_queue_status() # 您需要
-        # state.extend(queue_status)
+                all_links.append((link_info['rssi'], target_node, link_info))
         
-        # 3. 存储最新的状态向量，供将来（例如，其他节点）查询
+        all_links.sort(key=lambda x: x[0], reverse=True)
+        neighbors = all_links[:self.MAX_NEIGHBORS]
+        
+        neighbor_map_indices = []
+        
+        for rssi, target_node, link_info in neighbors:
+            state_vector.extend([
+                link_info['distance']/1000.0,
+                link_info['latency']/100.0,
+                link_info['loss']/100.0,
+                link_info['rssi']/100.0,
+                link_info['doppler_shift']/1000.0
+            ])
+            neighbor_map_indices.append(self.nodes.index(target_node))
+
+        # 5. 填充状态向量
+        padding_len = (self.MAX_NEIGHBORS * 5) - len(state_vector)
+        if padding_len > 0:
+            state_vector.extend([0.0] * padding_len)
+            
         self.node_states[node.name] = state_vector
-        return state_vector
+        return state_vector, neighbor_map_indices
 
-    # 新增函数，用于管理和返回 GRU 所需的状态序列 ---_>
+    # --- (v5) 状态序列 ---
     def get_state_sequence(self, node_name):
-        """获取并更新节点的状态历史序列，用于GRU"""
+        current_state_vector, neighbor_map_indices = self._get_current_state_vector(self.node_dict[node_name])
         
-        # 1. 获取当前时刻的最新状态
-        current_state_vector = self._get_current_state_vector(self.node_dict[node_name])
-        
-        # 2. 查找或创建该节点的状态历史 (deque)
         if node_name not in self.state_history:
-            # 创建一个固定长度的队列，并用 "零状态" 填充
             zero_state = [0.0] * self.state_dim
             self.state_history[node_name] = deque([zero_state] * self.seq_len, maxlen=self.seq_len)
             
-        # 3. 将最新状态推入队列 (最旧的状态会被自动挤出)
         self.state_history[node_name].append(current_state_vector)
         
-        # 4. 返回整个序列
-        return np.array(self.state_history[node_name])
+        return np.array(self.state_history[node_name]), neighbor_map_indices
 
 
-    def compute_node_reward(self, node):
-        
-
-        """计算指定节点的奖励"""
-        # (这是一个简化的奖励。在实际中，您应该基于流量生成器 (项目3)
-        # 测量的真实端到端延迟和吞吐量来计算奖励)
-        reward = 0
-        
-        # 简单地使用本地链路质量的平均值
-        link_qualities = []
-        
-        # <--- MODIFIED: 仅从最新的历史记录中计算奖励 ---_>
-        current_time = time.time()
-        for record in node.link_quality_history:
-            # 只看最近 2*interval 秒内的记录
-            if record['time'] > current_time - (self.interval * 2):
-                 # 奖励 = 10 - (延迟(ms)/10 * 0.5 + 丢包(%) * 0.5)
-                 # 目标: 延迟 < 10ms, 丢包 = 0%
-                 q = 10.0 - (min(record['latency'], 100)/10.0 * 0.5 + min(record['loss'], 100)/100.0 * 0.5)
-                 link_qualities.append(q)
-
-        if not link_qualities:
-            return -10.0 # 如果没有链路信息，给予惩罚
-            
-        return sum(link_qualities) / len(link_qualities)
-    # <--- MODIFIED: 新增函数，根据链路质量计算奖励值 ---_>
+    # --- (v5) 奖励计算 ---
     def _calculate_reward_from_link(self, link_info):
-        """根据单个链路信息计算奖励 (0-10)"""
         if not link_info:
-            return -10.0 # 惩罚不存在的链路
+            return -10.0 
         
-        # 奖励 = 10 - 延迟惩罚 - 丢包惩罚
-        # 目标: 延迟 < 20ms, 丢包 = 0%
-        
-        latency = min(link_info.get('latency', 100.0), 100.0)
+        latency = min(link_info.get('latency', 1000.0), 1000.0) 
         loss = min(link_info.get('loss', 100.0), 100.0)
         
-        # 延迟惩罚 (0-5分): 延迟 100ms 扣 5 分
         lat_penalty = (latency / 100.0) * 5.0
-        # 丢包惩罚 (0-5分): 丢包 100% 扣 5 分
         loss_penalty = (loss / 100.0) * 5.0
         
-        # 基础奖励 10 分
         reward = 10.0 - lat_penalty - loss_penalty
         
-        # 对极差的链路（例如 fping 失败）施加额外惩罚
-        if latency >= 9999.0 or loss == 100.0:
+        if latency >= 9999.0 or (loss == 100.0 and latency > 1000):
             return -5.0
             
         return reward
-    # 重写 update_routing 作为 PPO 的训练步骤 ---_>
-    # <--- MODIFIED: 重写 update_routing 以实现正确的奖励和学习循环 ---_>
+
+    
+    # --- MODIFIED (v6): 核心训练逻辑重构 ---
     def update_routing(self):
         """
-        为所有核心节点执行一个完整的 RL 步骤:
-        获取状态 -> 选择动作 -> 执行动作 -> 获取新状态 -> 存储经验 -> (等待) -> 学习
+        (v6)
+        执行一个完整的 决策 -> 执行 -> 测量 -> 学习 循环
+        以解决“奖励近视”问题
         """
         
-        # 1. 遍历所有核心节点智能体
-        for node_index, core_node in enumerate(self.nodes): # 使用 enumerate 获取索引
-            
-            # (假设所有节点都是核心节点，如果不是，您需要调整这里的逻辑)
+        all_actions_for_all_nodes = {} 
+        all_transitions = {} # 临时存储 (S, A, logP)
+        
+        # --- 步骤 1: 决策 (所有核心节点) ---
+        # (基于 S_t 决定 A_t)
+        for core_node in self.core_nodes: 
             agent = self.node_agents.get(core_node.name)
             if not agent:
-                print(f"错误: 节点 {core_node.name} 没有找到智能体")
-                continue
-
-            # 2. 获取状态 (时序)
-            state_seq = self.get_state_sequence(core_node.name)
+                continue 
             
-            # 3. 智能体选择动作 (主/备路径)
-            # <--- MODIFIED: 传入 self_index 用于掩码 ---_>
-            actions, old_logprobs = agent.select_action(state_seq, node_index)
+            node_index = self.nodes.index(core_node)
             
-            # 4. 在环境中执行动作 (下发路由)
-            self.apply_node_routing(core_node, actions)
-            
-            # 5. 获取执行动作后的新状态
-            new_state_seq = self.get_state_sequence(core_node.name)
-
-            # 6. <--- MODIFIED: 计算 *与动作相关* 的奖励 ---_>
-            total_reward_for_step = 0
-            valid_dests = 0
-            
-            for dest_index in range(self.num_dests):
-                if dest_index == node_index: # 跳过到自己的路由
-                    continue
-                
-                primary_hop_index = actions[dest_index][0]
-                backup_hop_index = actions[dest_index][1]
-                
-                primary_hop_node = self.nodes[primary_hop_index]
-                backup_hop_node = self.nodes[backup_hop_index]
-                
-                # 获取所选路径的链路质量
-                link_info_p = core_node.get_link_quality_by_mac(primary_hop_node.mac)
-                link_info_b = core_node.get_link_quality_by_mac(backup_hop_node.mac)
-                
-                # 计算奖励
-                r_p = self._calculate_reward_from_link(link_info_p)
-                r_b = self._calculate_reward_from_link(link_info_b)
-                
-                # 备用路径的奖励权重为 0.5
-                total_reward_for_step += (r_p + r_b * 0.5)
-                valid_dests += 1
-            
-            # 计算此时间步的平均奖励
-            reward = total_reward_for_step / valid_dests if valid_dests > 0 else 0
-            done = False 
-            
-            # 7. <--- MODIFIED: 记录这个 *真实的* 动作奖励用于绘图 ---_>
-            if core_node.name not in self.reward_history:
-                self.reward_history[core_node.name] = []
-            self.reward_history[core_node.name].append(reward)
-            
-            # 8. 存储经验
-            agent.store((state_seq, actions, reward, new_state_seq, old_logprobs, done))
+            # 1a. 获取局部状态 S_t
+            state_seq, neighbor_map_indices = self.get_state_sequence(core_node.name)
         
-        # --- 9. <--- MODIFIED: 全局学习步骤 ---_>
+            # 1b. 智能体选择动作 A_t
+            actions, old_logprobs = agent.select_action(state_seq, node_index, neighbor_map_indices)
+            
+            # 1c. 存储决策，稍后执行
+            all_actions_for_all_nodes[core_node.name] = actions
+            
+            # 1d. 存储经验的前半部分
+            all_transitions[core_node.name] = (state_seq, actions, old_logprobs)
+
+            
+        # --- 步骤 2: 执行 (所有节点) ---
+        # (应用 A_t 到环境中)
+        
+        # 2a. 应用核心节点的 PPO 路由
+        for node_name, node_actions in all_actions_for_all_nodes.items():
+            core_node = self.node_dict[node_name]
+            self.apply_node_routing(core_node, node_actions) # 下发 ip route
+
+        # 2b. 应用边缘节点的默认路由
+        for node in self.nodes:
+            if node not in self.core_nodes:
+                self.apply_default_routing(node)
+        
+        # (给路由一个极短的时间生效)
+        time.sleep(0.1) 
+            
+        # --- 步骤 3: 测量 (获取 E2E 结果) ---
+        # (运行 fping 来测量 A_t 导致的端到端结果 R_t)
+        self.test_all_links_concurrent()
+        
+        
+        # --- 步骤 4: 学习 (所有核心节点) ---
         self.global_steps += 1
         
-        # 当收集到足够的数据时 (例如 32 个时间步)
-        if self.global_steps % self.batch_size == 0:
-            print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
-            # 触发 *所有* 智能体学习
-            for agent in self.node_agents.values():
-                agent.learn() # PPO 智能体将使用它收集到的所有数据，然后清空内存
-            print("--- [学习步骤完成] ---\n")
-    
-    #  重写 apply_node_routing 以处理复杂的“主/备”动作 ---_>
-    def apply_node_routing(self, core_node, actions):
-        """
-        应用核心节点的路由决策 (主/备路径)
-        Args:
-            core_node (Node): 做出决策的节点
-            actions (list): 形状为 [num_dests, 2] 的动作索引列表
-                            actions[i][0] = 目的地i 的 主路径 下一跳索引
-                            actions[i][1] = 目的地i 的 备用路径 下一跳索引
-        """
-        
-        # (这是一个简化的路由下发。在您的项目中，这应该调用 FRR 的 VTYSH 或 API)
-        
-        print(f"--- 正在更新节点 {core_node.name} 的路由表 ---")
-
-        # 确保 self.nodes 列表作为索引是可用的
-        # self.nodes 列表就是我们的 "目的地" 和 "下一跳" 的索引
-        
-        for dest_index in range(self.num_dests):
-            dest_node = self.nodes[dest_index]
-            
-            # 跳过到自己的路由
-            if dest_node == core_node:
+        for core_node in self.core_nodes:
+            agent = self.node_agents.get(core_node.name)
+            if not agent:
                 continue
-                
-            primary_hop_index = actions[dest_index][0]
-            backup_hop_index = actions[dest_index][1]
+
+            # 4a. 取出经验的前半部分 (S_t, A_t, logP_t)
+            (state_seq, actions, old_logprobs) = all_transitions[core_node.name]
             
-            # 确保索引在范围内
+            # 4b. 获取新状态 S_{t+1}
+            new_state_seq, _ = self.get_state_sequence(core_node.name)
+            done = False 
+
+            # 4c. 计算 *端到端* 奖励 R_t
+            rewards_list = []
+            for dest_index in range(self.num_dests):
+                dest_node = self.nodes[dest_index]
+                if dest_node == core_node:
+                    rewards_list.append(0) # 到自己的奖励为0
+                    continue
+                
+                # --- 这是关键修正 ---
+                # 直接查找 core_node -> dest_node 的 E2E fping 结果
+                e2e_link_info = core_node.get_link_quality_by_mac(dest_node.mac)
+                reward = self._calculate_reward_from_link(e2e_link_info)
+                # --- 修正结束 ---
+                
+                rewards_list.append(reward)
+                
+                # 记录奖励 (用于绘图)
+                if dest_node.name not in self.reward_history[core_node.name]:
+                    self.reward_history[core_node.name][dest_name] = []
+                self.reward_history[core_node.name][dest_name].append(reward)
+
+            # 4d. 存储完整的经验 (S_t, A_t, R_t, S_{t+1})
+            agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
+            
+        # --- 步骤 5: 触发全局学习 ---
+        if self.global_steps % self.batch_size == 0 and self.global_steps > 0:
+            print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+            for agent in self.node_agents.values():
+                agent.learn()
+            print("--- [学习步骤完成] ---\n")
+            
+    
+    # --- (v5) 边缘路由逻辑 ---
+    def apply_default_routing(self, edge_node):
+        """
+        为边缘节点（非核心节点）设置简单的默认路由：
+        将所有流量路由到“邻居中”的“质量最好的”核心节点。
+        """
+        best_core_neighbor = None
+        best_quality = -float('inf')
+
+        if not self.core_nodes:
+            return 
+
+        # 1. 寻找 *邻居中* 质量最好的 *核心节点*
+        neighbors = []
+        for n in self.nodes: # 检查所有节点
+             if n == edge_node: continue
+             link_info = edge_node.get_link_quality_by_mac(n.mac)
+             if link_info and link_info['loss'] < 100: # 必须是可达的邻居
+                 neighbors.append((n, link_info))
+        
+        for neighbor_node, link_info in neighbors:
+            if neighbor_node in self.core_nodes: # 如果这个邻居是核心节点
+                quality = self._calculate_reward_from_link(link_info)
+                
+                if quality > best_quality:
+                    best_quality = quality
+                    best_core_neighbor = neighbor_node
+        
+        # 2. 下发默认路由
+        edge_node.cmd("ip route flush all proto 188") 
+        if best_core_neighbor:
+            core_ip = best_core_neighbor.ip.split('/')[0]
+            edge_node.cmd(f"ip route replace default via {core_ip} proto 188")
+
+
+    # --- (v5) 核心路由应用 ---
+    def apply_node_routing(self, core_node, actions_matrix):
+        """
+        应用核心节点的路由决策
+        """
+        
+        core_node.cmd("ip route flush all proto 188") 
+        
+        for dest_index, actions in enumerate(actions_matrix):
+            dest_node = self.nodes[dest_index]
+            if dest_node == core_node: continue
+                
+            primary_hop_index = actions[0]
+            backup_hop_index = actions[1]
+            
             if primary_hop_index >= len(self.nodes) or backup_hop_index >= len(self.nodes):
-                print(f"  到 {dest_node.name}: 索引越界，跳过")
                 continue
 
             primary_hop_node = self.nodes[primary_hop_index]
@@ -380,33 +402,16 @@ class Net:
             dest_ip = dest_node.ip.split('/')[0]
             primary_hop_ip = primary_hop_node.ip.split('/')[0]
             backup_hop_ip = backup_hop_node.ip.split('/')[0]
-            # <--- MODIFIED: 检查无效的下一跳 (虽然掩码应该阻止了，但这是双重保险) ---_>
-            if primary_hop_ip == core_node.ip.split('/')[0]:
-                # print(f"  检测到无效的主路由 {core_node.name} -> {primary_hop_node.name} -> {dest_node.name}，跳过")
-                continue # 跳过无效路由
 
-            # 下发主路由 (metric 10)
-            # 使用 `ip route replace` 来原子性地替换或添加路由
-            # `proto 188` 是一个示例，用于标记这些是AI生成的路由，方便清除
+            if primary_hop_ip == core_node.ip.split('/')[0] or primary_hop_ip == dest_ip:
+                continue 
+
             cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
             core_node.cmd(cmd_primary)
             
-            # 下发备用路由 (metric 20)
-            # 确保主备路径不同
-            if primary_hop_ip != backup_hop_ip:
-                # `ip route add` 用于添加第二条 (备用) 路径
+            if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_node.ip.split('/')[0] and backup_hop_ip != dest_ip:
                 cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
                 core_node.cmd(cmd_backup)
-            
-            # 打印调试信息 (只打印一两个作为示例)
-            if dest_index == 0 or dest_index == 1:
-                print(f"  到 {dest_node.name} ({dest_ip}):")
-                print(f"    主路 -> {primary_hop_node.name} ({primary_hop_ip}) [metric 10]")
-                if primary_hop_ip != backup_hop_ip:
-                    print(f"    备路 -> {backup_hop_node.name} ({backup_hop_ip}) [metric 20]")
-        
-        # print(f"--- 节点 {core_node.name} 路由更新完毕 ---")
-        
 
     def end_test(self):
         self.cleanup_interfaces()
@@ -505,7 +510,80 @@ class Net:
         # ... (此函数无需修改) ...
         pass
 
+    def select_core_nodes_distributed(self, num_nodes_rate=0.3):
+        """
+        (v5)
+        根据局部邻居质量选择核心节点，并动态迁移智能体。
+        """
+        print(f"\n--- [分布式核心节点选择 步骤 {self.global_steps}] ---")
+        
+        node_scores = {}
+        
+        # 1. 计算每个节点的“局部中心性”得分
+        for node in self.nodes:
+            score = 0
+            try:
+                # MODIFIED: 使用 get_link_quality_by_mac 替代 get_neighbor
+                for target_node in self.nodes:
+                    if target_node == node: continue
+                    link_info = node.get_link_quality_by_mac(target_node.mac)
+                    # 优质邻居：丢包 < 20% 且 延迟 < 100ms
+                    if link_info and link_info['loss'] < 20 and link_info['latency'] < 100:
+                        score += 1
+            except Exception as e:
+                print(f"  获取 {node.name} 邻居失败: {e}")
+                score = 0
+            node_scores[node.name] = score
+        
+        # 2. 选择 Top 30% 节点
+        num_core = max(1, int(len(self.nodes) * num_nodes_rate))
+        sorted_nodes = sorted(node_scores.items(), key=lambda item: item[1], reverse=True)
+        new_core_node_names = {name for name, score in sorted_nodes[:num_core]}
+        
+        old_core_node_names = set(self.node_agents.keys())
+        
+        print(f"  局部得分排名: {sorted_nodes}")
+        print(f"  原核心节点: {old_core_node_names}")
+        print(f"  新核心节点 (Top {num_core}): {new_core_node_names}")
+        
+        # 3. 初始化共享 Critic (如果不存在)
+        if not self.global_critic:
+            print("  创建共享 Critic (v5)...")
+            self.global_critic = PPOCritic(self.state_dim, self.num_dests, self.gru_hidden_dim, self.dest_embedding_dim)
+            self.global_critic_optimizer = torch.optim.Adam(self.global_critic.parameters(), lr=1e-3)
 
+        # 4. 智能体迁移
+        # 4a. 销毁下线的智能体
+        nodes_to_remove = old_core_node_names - new_core_node_names
+        for node_name in nodes_to_remove:
+            if node_name in self.node_agents:
+                del self.node_agents[node_name]
+                del self.reward_history[node_name]
+                print(f"  [迁移] 销毁节点 {node_name} 的智能体。")
+
+        # 4b. 创建上线的智能体
+        nodes_to_add = new_core_node_names - old_core_node_names
+        for node_name in nodes_to_add:
+            core_node = self.node_dict[node_name]
+            self.reward_history[core_node.name] = {}
+            
+            agent = PPOAgent(
+                state_dim=self.state_dim,
+                num_dests=self.num_dests,
+                num_next_hops=self.num_next_hops,
+                gru_hidden_dim=self.gru_hidden_dim,
+                dest_embedding_dim=self.dest_embedding_dim,
+                critic=self.global_critic, # 传入共享 Critic
+                critic_optimizer=self.global_critic_optimizer,
+                batch_size=self.batch_size 
+            )
+            self.node_agents[node_name] = agent
+            print(f"  [迁移] 已为新核心节点 {node_name} 创建 PPO 智能体。")
+        
+        # 5. 更新核心节点列表
+        self.core_nodes = [self.node_dict[name] for name in new_core_node_names]
+         
+                    
     # 取消注释 select_core_nodes 并实现 PPOAgent 的创建 ---_>
     def select_core_nodes(self, num_nodes_rate=0.3):
         """
@@ -788,74 +866,89 @@ class Net:
                 target= self.nodes[j]
                 self.plot_node_link_quality(src.name, target.name)
             
-    # <--- MODIFIED: 新增函数，用于绘制奖励历史 ---_>
     def plot_reward_history(self, save_path="test/reward_history.png"):
-        """绘制所有核心节点的奖励收敛曲线"""
-        plt.figure(figsize=(12, 8))
+        plt.figure(figsize=(15, 8))
         
-        for node_name, rewards in self.reward_history.items():
-            if rewards:
-                # 计算移动平均值，使曲线更平滑
-                moving_avg = np.convolve(rewards, np.ones(10)/10, mode='valid')
-                plt.plot(moving_avg, label=f"Node {node_name}")
+        all_rewards = [] 
         
-        plt.title("PPO Agent Reward History (Moving Average)")
-        plt.ylabel("Average Reward")
-        plt.xlabel("Training Step")
-        plt.legend()
+        for src_name, dest_dict in self.reward_history.items():
+            for dest_name, rewards in dest_dict.items():
+                if rewards:
+                    plt.plot(rewards, alpha=0.1, color='gray', label=f'_{src_name}-{dest_name}')
+                    all_rewards.append(rewards)
+
+        if not all_rewards:
+            print("没有收集到奖励数据，无法绘图。")
+            plt.close()
+            return
+
+        try:
+            max_len = max(len(r) for r in all_rewards)
+            padded_rewards = [r + [r[-1]] * (max_len - len(r)) if r else [0] * max_len for r in all_rewards]
+            
+            avg_rewards = np.mean(padded_rewards, axis=0)
+            
+            window_size = 5
+            if len(avg_rewards) > window_size:
+                moving_avg = np.convolve(avg_rewards, np.ones(window_size)/window_size, mode='valid')
+                plt.plot(np.arange(window_size-1, len(avg_rewards)), moving_avg, color='blue', linewidth=2, label=f'Global Average Reward (Moving Avg w={window_size})')
+            else:
+                plt.plot(avg_rewards, color='blue', linewidth=2, label='Global Average Reward')
+
+        except Exception as e:
+            print(f"计算平均奖励时出错: {e}")
+
+
+        plt.title(f"PPO Agent Reward History (v6 - E2E Reward + CTDE)")
+        plt.ylabel("Average Reward (E2E Per-Destination)")
+        plt.xlabel("Training Iteration (Global Step)")
+        plt.legend(loc='lower right')
         plt.grid(True)
-        
-        # 确保 test 目录存在
-        subprocess.run(["mkdir", "-p", "test"])
+        plt.tight_layout()
         plt.savefig(save_path)
         print(f"奖励历史图已保存到: {save_path}")
         plt.close()
 
-
     def test_all_links_concurrent(self):
-        threads = []
+        threads1 = []
+        threads2 = []
         n = len(self.nodes)
         
-        # <--- MODIFIED: 使用字典来组织任务，避免重复ping ---_>
-        tasks = {} # {node: {'ips': [], 'macs': []}}
-        
-        for i in range(n):
-            src_node = self.nodes[i]
-            if src_node.name not in tasks:
-                tasks[src_node.name] = {'ips': [], 'macs': []}
-                
-            for j in range(i + 1, n):
-                dst_node = self.nodes[j]
-                
-                # 双向任务
-                tasks[src_node.name]['ips'].append(dst_node.ip.split('/')[0])
-                tasks[src_node.name]['macs'].append(dst_node.mac)
-                
-                if dst_node.name not in tasks:
-                    tasks[dst_node.name] = {'ips': [], 'macs': []}
-                tasks[dst_node.name]['ips'].append(src_node.ip.split('/')[0])
-                tasks[dst_node.name]['macs'].append(src_node.mac)
+        # --- MODIFIED (v5): 总是为所有节点创建条目 ---
+        # 这样 get_link_quality_by_mac 总能找到
+        for src in self.nodes:
+            for dst in self.nodes:
+                if src == dst: continue
+                src.link_quality_history.append({
+                    'target': dst.name,
+                    'mac': dst.mac,
+                    'ip': dst.ip.split('/')[0],
+                    'time': time.time(),
+                    'rssi': -100 ,
+                    'bitrate': 0 ,
+                    'loss': 100 ,
+                    'latency': 9999 ,
+                })
+        # --- 结束 ---
 
-        def node_task(node, ips, macs):
-            """线程任务函数"""
-            if ips: # 确保有任务
-                node.get_latency(ips)
-                node.get_rssi(macs)
-        
-        for node_name, task in tasks.items():
-            node = self.node_dict[node_name]
-           # 优先从映射取节点，若不存在则回退到遍历 self.nodes 查找，避免 KeyError
-            node = self.node_dict.get(node_name)
-            if node is None:
-               node = next((n for n in self.nodes if n.name == node_name), None)
-            if node is None:
-                 print(f"[WARN] 未找到节点对象: {node_name}, 跳过该任务")
-                 continue
-            t = threading.Thread(target=node_task, args=(node, task['ips'], task['macs']))
-            threads.append(t)  
+        for i in range(n):
+            ips=[]
+            macs=[]
+            for j in range(n): # MODIFIED: fping all nodes, not just i+1
+                if i == j: continue
+                src = self.nodes[i]
+                dst = self.nodes[j]
+                
+                ips.append(dst.ip.split('/')[0])
+                macs.append(dst.mac)
+                
+            def node_task(node, ips, macs):
+                """线程任务函数"""
+                node.get_latency(ips) # 先 fping
+                node.get_rssi(macs)   # 再 iw (iw 会更新 fping 创建的条目)
+            t= threading.Thread(target=node_task, args=(self.nodes[i], ips, macs))
+            threads1.append(t)  
             t.start()
             
-        for t in threads:
+        for t in threads1:
             t.join()
-        
-   

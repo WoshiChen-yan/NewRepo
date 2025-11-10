@@ -9,10 +9,10 @@ import matplotlib.pyplot as plt # <--- MODIFIED: 导入 matplotlib
 Net_1 = Net(name='Net_1', interval=1) # 1秒一个时间步
 Net_1.add_node(name="11", mac="02:00:00:00:01:00", ip="10.10.10.1/24",position= (140, 0, 0), direction=(-10, 0, 0))
 Net_1.add_node(name="12", mac="02:00:00:00:02:00", ip="10.10.10.2/24",position= (-140, 0, 0),direction= (10, 0, 0))
-Net_1.add_node(name="13", mac="02:00:00:00:03:00", ip="10.10.10.3/24",position=(-100, 0, 0),direction=(0, 0, 0))
-Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(150, 0, 30),(1, 1, 0))
-Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 10))
-Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(1,20,300),(10,10,1))
+# Net_1.add_node(name="13", mac="02:00:00:00:03:00", ip="10.10.10.3/24",position=(-100, 0, 0),direction=(0, 0, 0))
+# Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(150, 0, 30),(1, 1, 0))
+# Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 10))
+# Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(1,20,300),(10,10,1))
 # Net_1.add_node("17", "02:00:00:00:00:07","10.10.10.7/24",(10,20,30),(1,1,10))
 # docker stop 11&&docker rm 11&&docker stop 12&&docker rm 12&&docker stop 13&&docker rm 13&&docker stop 14&&docker rm 14
 
@@ -23,7 +23,7 @@ time.sleep(5)
 
 # <--- MODIFIED: 3. 初始化 PPO 智能体 ---_>
 # 这将创建共享 Critic 和所有 Agent
-Net_1.select_core_nodes() 
+Net_1.select_core_nodes_distributed(num_nodes_rate=0.4) 
 print("核心节点和 PPO 智能体已初始化。")
 
 # <--- MODIFIED: 4. (可选) 启动背景流量 (项目3) ---_>
@@ -49,7 +49,7 @@ except Exception as e:
 print("=== 智能路由训练与测试开始 ===")
 times={}
 time_all=time.time()
-training_steps = 15 # <--- MODIFIED: 定义训练步数
+training_steps = 20 # <--- MODIFIED: 定义训练步数
 
 # <--- MODIFIED: 5. 更改为主训练/仿真循环 ---_>
 for i in range(training_steps): 
@@ -57,13 +57,20 @@ for i in range(training_steps):
     time2 = time.time()
     print(f"===第{i+1}/{training_steps}次迭代===")
 
-    # 1. 移动节点 (模拟动态拓扑)
+    # 移动节点 (模拟动态拓扑)
     Net_1.move_nodes()
     
-    # 2. 测量当前网络状态 (更新链路质量历史)
+    # 智能体迁移 (核心)
+    #    定期重选核心节点
+    if i % Net_1.agent_migration_interval == 0 or i == 0:
+        # v6 修正: 选举前必须先测量一次，否则没有数据
+        Net_1.test_all_links_concurrent() 
+        Net_1.select_core_nodes_distributed(num_nodes_rate=0.3) # 选择 30% 的核心节点
+    
+    # 测量当前网络状态 (更新链路质量历史)
     Net_1.test_all_links_concurrent()
     
-    # 3. 执行 PPO 训练步骤 (核心)
+    # 执行 PPO 训练步骤 (核心)
     #    (获取状态 -> 选动作 -> 执行路由 -> 存经验 -> 学习)
     Net_1.update_routing()
     
