@@ -9,7 +9,7 @@ import subprocess
 from module import Mac80211Hwsim
 from Wirelesslink import wlsintf
 from wmediumdConnector import WStarter, w_server, WmediumdException,w_gain, SNRLink, ERRPROBLink, w_pos, w_txpower
-from dqn_agent import DQNAgent
+
 nodes=[]
 
 # 找到 self.nodes 列表的辅助函数
