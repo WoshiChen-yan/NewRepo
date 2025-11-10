@@ -34,8 +34,8 @@ class Net:
          self.node_agents={}#用于存储核心节点的智能体
          
           # --- 局部状态和动作空间 ---
-         self.MAX_NEIGHBORS = 10 # 假设每个节点最多有10个邻居 
-         self.state_dim = self.MAX_NEIGHBORS * 5 
+         self.MAX_NEIGHBORS=1  # 假设每个节点最多有10个邻居 
+         self.state_dim = self.MAX_NEIGHBORS * 5  # 每个邻居5个特征: distance, latency, loss, rssi, doppler
         
         
         
@@ -47,8 +47,8 @@ class Net:
          self.state_dim = 0 # <---  将在 select_core_nodes 中设置
          
          
-         self.num_dests = 7 # <---  将在 select_core_nodes 中设置
-         self.num_next_hops = 7 # <---  将在 select_core_nodes 中设置
+         self.num_dests =  0# <---  将在 select_core_nodes 中设置
+         self.num_next_hops =  0# <---  将在 select_core_nodes 中设置
          self.dest_embedding_dim = 16 
          
          
@@ -518,6 +518,13 @@ class Net:
         print(f"\n--- [分布式核心节点选择 步骤 {self.global_steps}] ---")
         
         node_scores = {}
+        total_nodes = len(self.nodes)
+        if total_nodes == 0:
+            print("  警告：网络中没有节点，无法选择核心节点。")
+            return
+        
+        self.num_dests= total_nodes
+        self.num_next_hops= total_nodes
         
         # 1. 计算每个节点的“局部中心性”得分
         for node in self.nodes:

@@ -63,8 +63,9 @@ class PPOCritic(nn.Module):
         last_state_out = gru_out[:, -1, :] # 形状 [batch_size, gru_hidden_dim]
         
         # 2. 处理目标ID
-        # .squeeze(1) 
         dest_embedding = self.dest_embed(x_dest_idx) # 形状 [batch_size, dest_embedding_dim]
+        if dest_embedding.dim() == 3: # 处理 [batch_size, 1, dim] 的情况
+             dest_embedding = dest_embedding.squeeze(1)
         
         # 3. 拼接
         combined = torch.cat([last_state_out, dest_embedding], dim=1)
@@ -100,7 +101,14 @@ class PPOAgent:
         self.num_dests = num_dests
         self.num_next_hops = num_next_hops
 
+    # --- MODIFIED (v6): 动作掩码 (Action Masking) ---
     def select_action(self, state, self_index, neighbor_map_indices):
+        """
+        Args:
+            state (np.array): 形状为 [seq_len, state_dim]
+            self_index (int): 智能体所在节点的 *全局* 索引
+            neighbor_map_indices (list): *有效邻居* 的 *全局* 索引列表
+        """
         state = torch.FloatTensor(state).unsqueeze(0)  # [1, seq_len, state_dim]
         
         # logits 形状 [1, num_dests, 2, num_next_hops]
@@ -115,31 +123,39 @@ class PPOAgent:
             for path_type in range(2):
                 
                 path_logits = logits[0, dest_index, path_type].clone() 
-                mask_value = -torch.inf
+                mask_value = -torch.inf # 使用 -infinity
                 
-                # --- MODIFIED (v5): 掩码逻辑更新 ---
-                # 1. 创建一个全掩码
+                # --- 动作掩码 (Action Masking) ---
+                # 1. 创建一个全掩码 (所有动作都被禁止)
                 mask = torch.full_like(path_logits, mask_value)
                 
-                # 2. 只允许选择有效的邻居
-                if neighbor_map_indices: # 确保邻居列表不为空
+                # 2. 只有有效的邻居可以被选中
+                if neighbor_map_indices: # 检查列表是否为空
                     valid_indices = torch.LongTensor(neighbor_map_indices)
-                    mask[valid_indices] = 0.0 # 允许选择邻居
+                    mask[valid_indices] = 0.0 # 解除掩码
                 
-                # 3. (双重保险) 确保不能选自己或目的地
+                # 3. 严格禁止：选择自己
                 mask[self_index] = mask_value
+                # 4. 严格禁止：选择目的地
                 mask[dest_index] = mask_value
-                
-                # 4. 应用掩码
-                path_logits = path_logits + mask
                 # --- 掩码结束 ---
 
-                probs = torch.softmax(path_logits, dim=-1)
-                dist = torch.distributions.Categorical(probs)
-                action = dist.sample()
+                # 应用掩码 (logits + mask)
+                path_logits = path_logits + mask
                 
+                # 检查是否所有动作都被掩盖了 (例如, 孤立节点)
+                if torch.all(torch.isinf(path_logits)):
+                    # 如果全被掩盖, 强行选择一个 (比如自己，虽然无效但至少不会崩溃)
+                    action = torch.tensor(self_index) 
+                    logprob = torch.tensor(-1e9) # 极低的 log_prob
+                else:
+                    probs = torch.softmax(path_logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs)
+                    action = dist.sample()
+                    logprob = dist.log_prob(action)
+
                 dest_actions.append(action.item())
-                dest_logprobs.append(dist.log_prob(action).item())
+                dest_logprobs.append(logprob.item())
                 
             actions.append(dest_actions)      # [num_dests, 2]
             logprobs.append(dest_logprobs)    # [num_dests, 2]
@@ -150,6 +166,7 @@ class PPOAgent:
         # transition: (state, actions, rewards_list, next_state, old_logprobs, done)
         self.memory.append(transition)
 
+    # --- MODIFIED (v6): 添加梯度裁剪 ---
     def learn(self): 
         if len(self.memory) < self.batch_size:
             return 
@@ -167,8 +184,6 @@ class PPOAgent:
         old_logprobs = torch.FloatTensor(old_logprobs_list) # [batch, num_dests, 2]
         dones = torch.FloatTensor(dones).unsqueeze(1)     # [batch, 1]
 
-        # --- MODIFIED (v5): 循环为每个目的地训练 ---
-        # Actor 和 Critic 的损失是所有目的地的总和
         
         actor_loss_total = 0
         critic_loss_total = 0
