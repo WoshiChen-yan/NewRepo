@@ -184,6 +184,7 @@ class PPOAgent:
         old_logprobs = torch.FloatTensor(old_logprobs_list) # [batch, num_dests, 2]
         dones = torch.FloatTensor(dones).unsqueeze(1)     # [batch, 1]
 
+        current_batch_size = states.shape(0)
         
         actor_loss_total = 0
         critic_loss_total = 0
@@ -192,7 +193,7 @@ class PPOAgent:
 
         for dest_index in range(self.num_dests):
             # 准备 Critic 输入
-            dest_idx_tensor = torch.LongTensor([dest_index] * self.batch_size) # [batch_size]
+            dest_idx_tensor = torch.LongTensor([dest_index] * current_batch_size) # [batch_size]
             
             # --- 计算优势 (Advantage) ---
             # V(s, d) 和 V(s', d)

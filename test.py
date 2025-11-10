@@ -40,7 +40,7 @@ except Exception as e:
 print("=== 智能路由训练与测试开始 ===")
 times={}
 time_all=time.time()
-training_steps = 80 
+training_steps = 20 
 
 # <--- MODIFIED: 4. 主训练/仿真循环 (v6) ---_>
 for i in range(training_steps): 
