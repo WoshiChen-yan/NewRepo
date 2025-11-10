@@ -258,100 +258,122 @@ class Node(object):
         return angle
         
     
-    def get_rssi(self , macs):
-          # 2. 获取 RSSI、bitrate 等
-        wlan_name = f"wlan{self.name}"
-        station_dump = self.cmd(f"iw dev {wlan_name} station dump")
-        stats={}
-        count=station_dump.count('Station ')
+    def get_rssi(self, macs):
+        """
+        (MODIFIED)
+        运行 iw dev wlanX station dump 并返回一个包含 RSSI 和 Bitrate 的字典
+        格式: { 'mac': {'rssi': -50.0, 'bitrate': 144.4}, ... }
+        不再修改 self.link_quality_history
+        """
+        if not macs:
+            return {}
         
-        for mac in macs:
-            rssi= -100  # 默认值
-            bitrate = 0  # 默认值
-            found = False
+        # 将 macs 转换为小写 set 以便快速查找
+        target_macs = set(m.lower() for m in macs)
             
-            for block in station_dump.split('Station '):
-                if mac.lower() in block.lower():
-                    found = True
-                    for line in block.split('\n'):
-                        if 'signal:' in line:
-                            try:
-                                rssi = float(line.split()[1])
-                            except:
-                                pass
-                        if 'tx bitrate:' in line:
-                            try:
-                                bitrate = float(line.split()[2])
-                            except:
-                                pass 
-                    stats[mac] = {'rssi': rssi, 'bitrate': bitrate}    
-                    break
+        command = f"iw dev {self.name} station dump"
+        iw_output = self.cmd(command) # 这将使用 docker exec_run
+        
+        results = {}
+        current_mac = None
+        
+        for line in iw_output.splitlines():
+            if line.strip().startswith("Station"):
+                try:
+                    mac = line.split()[1].lower()
+                    if mac in target_macs:
+                        current_mac = mac
+                        # 为这个 MAC 初始化一个空字典
+                        if current_mac not in results:
+                            results[current_mac] = {}
+                    else:
+                        current_mac = None # 不是我们关心的 MAC
+                except IndexError:
+                    current_mac = None
+                continue
             
-            # <--- MODIFIED: 确保即使没找到MAC，也更新历史记录 ---_>
-            # 在 fping 之后，我们总是有一个历史记录条目
-            # 我们需要找到它并更新它
-            for record in reversed(self.link_quality_history):
-                if record.get('mac') == mac.lower():
-                    # 仅在 fping 成功后才更新（即 latency 不是默认值）
-                    if record.get('latency', 9999) != 9999:
-                        record['rssi'] = rssi
-                        record['bitrate'] = bitrate
-                    break
-                    
-        # print(f"节点 {self.name} 的 station dump 中找到 {count} 个 MAC 地址的信息")
-        if not found:
-            pass # print(f"未在 {wlan_name} 的 station dump 中找到 {macs} 的信息")
-            
-        
-        
-    def get_latency(self,target_ips, count=5):
-        time1= time.time()
-        ips_str = ' '.join(target_ips)
-        cmd = f"fping -c {count} -q {ips_str} -t 100 -p 1"
-        result = self.cmd(cmd)
-        # print(f"节点 {self.name} 的 fping 结果:\n {result}")
-        stats = {}
-        
-        # <--- MODIFIED: 预先为所有 target_ips 创建历史条目 ---_>
-        # 这样 get_rssi 就能找到对应的条目
-        ip_to_mac_map = {node.ip.split('/')[0]: node.mac for node in nodes if node.ip.split('/')[0] in target_ips}
-        
-        for ip in target_ips:
-            stats[ip] = {'loss': 100.0, 'avg_latency': 9999.0} # 默认值
-            # 添加/更新历史记录
-            self.link_quality_history.append({
-                'target': get_node_by_mac(ip_to_mac_map[ip]).name if ip in ip_to_mac_map else 'unknown',
-                'mac': ip_to_mac_map.get(ip, 'unknown'),
-                'ip': ip,
-                'time': time.time(),
-                'rssi': -100,
-                'bitrate': 0,
-                'loss': 100.0,
-                'latency': 9999.0,
-            })
-
-        for line in result.splitlines():
-            m = re.match(r'(\S+) : xmt/rcv/%loss = (\d+)/(\d+)/([\d\.]+)%, min/avg/max = ([\d\.]+)/([\d\.]+)/([\d\.]+)', line)
-            if m:
-                ip = m.group(1)
-                loss = float(m.group(4))
-                if loss == 100.0:
-                    avg = 9999.0 # 使用一个大的有限值
-                else : 
-                    avg = float(m.group(6))
-                stats[ip] = {'loss': loss, 'avg_latency': avg}
+            if current_mac:
+                # 寻找 'signal' (平均信号强度)
+                if "signal" in line:
+                    try:
+                        rssi = float(line.split()[2])
+                        results[current_mac]['rssi'] = rssi
+                    except (ValueError, IndexError):
+                        pass # 解析 RSSI 失败
                 
-        for ip, stat in stats.items():
-            for record in reversed(self.link_quality_history):
-                if record.get('ip') == ip :
-                    record['latency'] = stat['avg_latency']
-                    record['loss'] = stat['loss']
-                    break
-                    
-        # time2= time.time()
-        # print(f"节点 {self.name} 的 fping 耗时: {time2-time1:.2f}秒")
-        return stats
+                # 寻找 'tx bitrate' (发送速率)
+                if "tx bitrate" in line:
+                    try:
+                        bitrate = float(line.split()[2])
+                        results[current_mac]['bitrate'] = bitrate
+                    except (ValueError, IndexError):
+                        pass # 解析 bitrate 失败
+                
+                # 如果没有 'tx bitrate'，回退到 'rx bitrate'
+                elif "rx bitrate" in line and 'bitrate' not in results[current_mac]:
+                    try:
+                        bitrate = float(line.split()[2])
+                        results[current_mac]['bitrate'] = bitrate
+                    except (ValueError, IndexError):
+                        pass # 解析 bitrate 失败
 
+        return results
+        
+    def get_latency(self, ips):
+        """
+        (MODIFIED)
+        运行 fping 并返回一个包含延迟和丢包的字典
+        格式: { 'ip': {'latency': 10.0, 'loss': 0.0}, ... }
+        不再修改 self.link_quality_history
+        """
+        if not ips:
+            return {}
+        
+        ip_list_str = ' '.join(ips)
+        # 关键: 我们需要 fping 的摘要 (在 stderr 上)
+        # 我们使用 2>&1 将 stderr 重定向到 stdout，以便 self.cmd() 可以捕获它
+        command = f"fping -c 3 -q -t 100 {ip_list_str} 2>&1"
+        
+        fping_output = self.cmd(command)
+        results = {}
+
+        # fping -q 的摘要输出格式为:
+        # 10.10.10.1 : xmt/rcv/%loss = 3/3/0%, min/avg/max = 1.10/1.23/1.39
+        # 10.10.10.3 : xmt/rcv/%loss = 3/0/100%
+        
+        for line in fping_output.splitlines():
+            if "loss" not in line:
+                continue
+
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+
+            ip = parts[0]
+            loss_percent = -1.0
+            avg_latency = 9999.0
+
+            try:
+                # 解析 "xmt/rcv/%loss = 3/3/0%"
+                loss_str = parts[4].strip('%,')
+                loss_percent = float(loss_str)
+            except (ValueError, IndexError):
+                continue # 解析 loss 失败
+
+            # 如果可达 (loss < 100%)，则解析延迟
+            if loss_percent < 100.0 and len(parts) > 7:
+                try:
+                    # 解析 "min/avg/max = 1.10/1.23/1.39"
+                    avg_latency = float(parts[7].split('/')[1])
+                except (ValueError, IndexError):
+                    # 无法解析 avg_latency，保持 9999.0
+                    pass
+            
+            results[ip] = {'latency': avg_latency, 'loss': loss_percent}
+
+        return results
+   
+        
     # <--- MODIFIED: 新增函数，用于构建完整的状态向量 ---_>
     def get_link_quality_by_mac(self, target_mac):
         """
