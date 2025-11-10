@@ -34,7 +34,7 @@ class Net:
          self.node_agents={}#用于存储核心节点的智能体
          
           # --- 局部状态和动作空间 ---
-         self.MAX_NEIGHBORS=0  # 假设每个节点最多有10个邻居 
+         
            # 每个邻居5个特征: distance, latency, loss, rssi, doppler
         
         
@@ -46,7 +46,7 @@ class Net:
          self.seq_len = 5 # <---  定义GRU要看的时间序列长度
          self.state_dim = 0 # <---  将在 select_core_nodes 中设置
          
-         
+         self.MAX_NEIGHBORS = 0 # <--- 每个节点考虑的最大邻居数
          self.num_dests =  0# <---  将在 select_core_nodes 中设置
          self.num_next_hops =  0# <---  将在 select_core_nodes 中设置
          self.dest_embedding_dim = 16 
@@ -156,6 +156,19 @@ class Net:
             Mac80211Hwsim(on_the_fly=True,Node=node)
             node.addwlans()  
             # node.set_ovsbridge(6633)
+            
+        total_nodes = len(self.nodes)
+        if total_nodes == 0:
+            print("  警告：网络中没有节点，无法选择核心节点。")
+            return
+        
+        self.num_dests= total_nodes
+        self.num_next_hops= total_nodes
+        self.MAX_NEIGHBORS = total_nodes - 1
+        self.state_dim = self.MAX_NEIGHBORS * 5
+        
+        
+        
         self.wmediumd_config()
         self.start_wmediumd_inbackground()
         time.sleep(1)
@@ -329,8 +342,8 @@ class Net:
                 
                 # 记录奖励 (用于绘图)
                 if dest_node.name not in self.reward_history[core_node.name]:
-                    self.reward_history[core_node.name][dest_name] = []
-                self.reward_history[core_node.name][dest_name].append(reward)
+                    self.reward_history[core_node.name][dest_node.name] = []
+                self.reward_history[core_node.name][dest_node.name].append(reward)
 
             # 4d. 存储完整的经验 (S_t, A_t, R_t, S_{t+1})
             agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
@@ -518,14 +531,6 @@ class Net:
         print(f"\n--- [分布式核心节点选择 步骤 {self.global_steps}] ---")
         
         node_scores = {}
-        total_nodes = len(self.nodes)
-        if total_nodes == 0:
-            print("  警告：网络中没有节点，无法选择核心节点。")
-            return
-        
-        self.num_dests= total_nodes
-        self.num_next_hops= total_nodes
-        self.state_dim = (total_nodes - 1) * 5
         
         # 1. 计算每个节点的“局部中心性”得分
         for node in self.nodes:
