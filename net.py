@@ -541,7 +541,7 @@ class Net:
                     if target_node == node: continue
                     link_info = node.get_link_quality_by_mac(target_node.mac)
                     # 优质邻居：丢包 < 20% 且 延迟 < 100ms
-                    if link_info and link_info['loss'] < 20 and link_info['latency'] < 100:
+                    if link_info and link_info['loss'] < 80 and link_info['latency'] < 200:
                         score += 1
             except Exception as e:
                 print(f"  获取 {node.name} 邻居失败: {e}")
