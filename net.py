@@ -34,8 +34,8 @@ class Net:
          self.node_agents={}#用于存储核心节点的智能体
          
           # --- 局部状态和动作空间 ---
-         self.MAX_NEIGHBORS=1  # 假设每个节点最多有10个邻居 
-         self.state_dim = self.MAX_NEIGHBORS * 5  # 每个邻居5个特征: distance, latency, loss, rssi, doppler
+         self.MAX_NEIGHBORS=0  # 假设每个节点最多有10个邻居 
+           # 每个邻居5个特征: distance, latency, loss, rssi, doppler
         
         
         
@@ -525,6 +525,7 @@ class Net:
         
         self.num_dests= total_nodes
         self.num_next_hops= total_nodes
+        self.state_dim = (total_nodes - 1) * 5
         
         # 1. 计算每个节点的“局部中心性”得分
         for node in self.nodes:
