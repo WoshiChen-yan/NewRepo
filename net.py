@@ -171,7 +171,9 @@ class Net:
         
         self.wmediumd_config()
         self.start_wmediumd_inbackground()
-        time.sleep(1)
+        print(f"等待节点进入稳定............")
+        time.sleep(8)
+        
     
     def move_nodes(self):
         for node in self.nodes:
@@ -385,10 +387,10 @@ class Net:
                     best_core_neighbor = neighbor_node
         
         # 2. 下发默认路由
-        edge_node.cmd("ip route flush all proto 188") 
+        edge_node.cmd("ip route flush table main") 
         if best_core_neighbor:
             core_ip = best_core_neighbor.ip.split('/')[0]
-            edge_node.cmd(f"ip route replace default via {core_ip} proto 188")
+            edge_node.cmd(f"ip route replace default via {core_ip} ")
 
 
     # --- (v5) 核心路由应用 ---
@@ -443,7 +445,7 @@ class Net:
             if node.name==name:
                 node.remove_node()
         
-    def generate_nodes(self, num_nodes, pattern="random", base_position=(0,0,10), spacing=3):
+    def generate_nodes(self, num_nodes, pattern="random", base_position=(0,0,0), spacing=3):
         """
         Automatically generate and add nodes to the network with different position patterns
         Args:
@@ -509,19 +511,67 @@ class Net:
             return tuple(np.zeros_like(vector))
         return tuple(vector / norm)
     
-    def yawmd_config(self, output_path="test.cfg", append=False):
-        # ... (此函数无需修改) ...
-        pass
             
-            
-    def wmediumd_config(self):
-        # ... (此函数无需修改) ...
-        pass
+
+    def wmediumd_config(self, path='test.cfg'):
+        """
+        生成 wmediumd 配置文件（test.cfg），格式与示例一致。
+        使用 self.nodes 中的 mac, position, direction, txpower 字段。
+        """
+        # prepare lists
+        ids = [f'"{n.mac}"' for n in self.nodes]
+        positions = [f"({n.position[0]:.1f}, {n.position[1]:.1f}, {n.position[2]:.1f})" for n in self.nodes]
+        # directions 精确到小数点后一位，确保三元组存在
+        directions = []
+        for n in self.nodes:
+            d = n.direction
+            if isinstance(d, (list, tuple)):
+                if len(d) >= 3:
+                    directions.append(f"({d[0]:.1f}, {d[1]:.1f})")
+                elif len(d) == 2:
+                    directions.append(f"({d[0]:.1f}, {d[1]:.1f}, 0.0)")
+                else:
+                    directions.append("(0.0, 0.0, 0.0)")
+            else:
+                directions.append("(0.0, 0.0, 0.0)")
+        txpowers = [f"{getattr(n, 'txpower', 30.0):.1f}" for n in self.nodes]
+
+        content = []
+        content.append("ifaces :")
+        content.append("{")
+        content.append(f"    count={len(ids)};")
+        content.append("    ids = [")
+        content.append("    " + ",\n    ".join(ids))
+        content.append("    ];")
+        content.append("}")
+        content.append("        ")
+        content.append("model :")
+        content.append("{")
+        content.append('    type = "path_loss";')
+        content.append("    positions = (")
+        content.append("        " + ",\n        ".join(positions))
+        content.append("    );")
+        content.append("    directions = (")
+        content.append("        " + ",\n        ".join(directions))
+        content.append("    );")
+        content.append("    tx_powers = (" + ", ".join(txpowers) + ");")
+        content.append('    model_name = "log_distance";')
+        content.append("    path_loss_exp = 3.5;")
+        content.append("    xg = 0.0;")
+        content.append("};")
+
+        cfg_text = "\n".join(content) + "\n"
+
+        try:
+            with open(path, "w") as f:
+                f.write(cfg_text)
+            print(f"wmediumd 配置已写入: {path}")
+        except Exception as e:
+            print(f"[ERROR] 写入 wmediumd 配置失败: {e}")
+
     
     
-    def test_connectivity(self, count=10, timeout=1):
-        # ... (此函数无需修改) ...
-        pass
+   
 
     def select_core_nodes_distributed(self, num_nodes_rate=0.3):
         """
@@ -922,46 +972,117 @@ class Net:
         print(f"奖励历史图已保存到: {save_path}")
         plt.close()
 
-    def test_all_links_concurrent(self):
-        threads1 = []
-        threads2 = []
-        n = len(self.nodes)
+    # def test_all_links_concurrent(self):
+    #     threads= []
+    #     threads_results = {}
+    #     n = len(self.nodes)
         
-        # --- MODIFIED (v5): 总是为所有节点创建条目 ---
-        # 这样 get_link_quality_by_mac 总能找到
-        for src in self.nodes:
-            for dst in self.nodes:
-                if src == dst: continue
-                src.link_quality_history.append({
-                    'target': dst.name,
-                    'mac': dst.mac,
-                    'ip': dst.ip.split('/')[0],
-                    'time': time.time(),
-                    'rssi': -100 ,
-                    'bitrate': 0 ,
-                    'loss': 100 ,
-                    'latency': 9999 ,
-                })
-        # --- 结束 ---
+    #     # --- 总是为所有节点创建条目 ---
+    #     # 这样 get_link_quality_by_mac 总能找到
+    #     for src in self.nodes:
+    #         for dst in self.nodes:
+    #             if src == dst: continue
+    #             src.link_quality_history.append({
+    #                 'target': dst.name,
+    #                 'mac': dst.mac,
+    #                 'ip': dst.ip.split('/')[0],
+    #                 'time': time.time(),
+    #                 'rssi': -100 ,
+    #                 'bitrate': 0 ,
+    #                 'loss': 100 ,
+    #                 'latency': 9999 ,
+    #             })
+    #     # --- 结束 ---
+
+    #     for i in range(n):
+    #         ips=[]
+    #         macs=[]
+    #         for j in range(n): # MODIFIED: fping all nodes, not just i+1
+    #             if i == j: continue
+    #             src = self.nodes[i]
+    #             dst = self.nodes[j]
+                
+    #             ips.append(dst.ip.split('/')[0])
+    #             macs.append(dst.mac)
+                
+    #         def node_task(node, ips, macs):
+    #             """线程任务函数"""
+    #             node.get_latency(ips) # 先 fping
+    #             node.get_rssi(macs)   # 再 iw (iw 会更新 fping 创建的条目)
+    #         t= threading.Thread(target=node_task, args=(self.nodes[i], ips, macs))
+    #         threads.append(t)  
+    #         t.start()
+            
+    #     for t in threads:
+    #         t.join()
+    def test_all_links_concurrent(self):
+        """
+        (REFACTORED)
+        并发测试所有链路，并为每个 src -> dst 对追加一个*单独的*、*合并的*历史条目。
+        这可以防止 "锯齿" 图和数据污染。
+        """
+        threads = []
+        # 用于收集所有线程的原始数据
+        # 格式: { 'node_name': (latency_results_dict, rssi_results_dict), ... }
+        thread_results = {}
+        n = len(self.nodes)
+
+        def node_task(node, ips, macs):
+            """线程任务函数：获取数据并存储在共享字典中"""
+            latency_results = node.get_latency(ips) # 返回 {ip: data}
+            rssi_results = node.get_rssi(macs)     # 返回 {mac: data}
+            thread_results[node.name] = (latency_results, rssi_results)
 
         for i in range(n):
-            ips=[]
-            macs=[]
-            for j in range(n): # MODIFIED: fping all nodes, not just i+1
+            src_node = self.nodes[i]
+            ips = []
+            macs = []
+            for j in range(n):
                 if i == j: continue
-                src = self.nodes[i]
-                dst = self.nodes[j]
+                dst_node = self.nodes[j]
+                ips.append(dst_node.ip.split('/')[0])
+                macs.append(dst_node.mac.lower()) # 确保 MAC 是小写
                 
-                ips.append(dst.ip.split('/')[0])
-                macs.append(dst.mac)
-                
-            def node_task(node, ips, macs):
-                """线程任务函数"""
-                node.get_latency(ips) # 先 fping
-                node.get_rssi(macs)   # 再 iw (iw 会更新 fping 创建的条目)
-            t= threading.Thread(target=node_task, args=(self.nodes[i], ips, macs))
-            threads1.append(t)  
+            t = threading.Thread(target=node_task, args=(src_node, ips, macs))
+            threads.append(t)
             t.start()
             
-        for t in threads1:
-            t.join()
+        for t in threads:
+            t.join() # 等待所有 fping/iw 完成
+
+        # --- 核心修改：数据合并与追加 ---
+        current_time = time.time()
+        for src in self.nodes:
+            # 检查节点是否有返回结果 (如果线程出错则跳过)
+            if src.name not in thread_results:
+                continue    
+            latency_data, rssi_data = thread_results[src.name]
+            for dst in self.nodes:
+                if src == dst:
+                    continue
+                    
+                dst_ip = dst.ip.split('/')[0]
+                dst_mac = dst.mac.lower()
+                
+                # 1. 建立此时间步的默认条目
+                final_entry = {
+                    'target': dst.name,
+                    'mac': dst.mac,
+                    'ip': dst_ip,
+                    'time': current_time,
+                    'rssi': -100.0,    # 默认 (无法通信)
+                    'bitrate': 0.0,    # 默认 (无法通信)
+                    'loss': 100.0,     # 默认 (无法通信)
+                    'latency': 9999.0  # 默认 (无法通信)
+                }
+                
+                # 2. 如果 fping 找到了延迟/丢包数据，则覆盖
+                if dst_ip in latency_data:
+                    final_entry.update(latency_data[dst_ip])
+                    
+                # 3. 如果 iw 找到了 RSSI/Bitrate 数据，则覆盖
+                if dst_mac in rssi_data:
+                    final_entry.update(rssi_data[dst_mac])
+                    
+                # 4. 追加这一个合并后的、完整的数据点
+                src.link_quality_history.append(final_entry)

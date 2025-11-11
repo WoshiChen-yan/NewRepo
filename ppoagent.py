@@ -137,8 +137,8 @@ class PPOAgent:
                 # 3. 严格禁止：选择自己
                 mask[self_index] = mask_value
                 # 4. 严格禁止：选择目的地
-                mask[dest_index] = mask_value
-                # --- 掩码结束 ---
+                # mask[dest_index] = mask_value
+                
 
                 # 应用掩码 (logits + mask)
                 path_logits = path_logits + mask

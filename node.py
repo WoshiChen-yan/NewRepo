@@ -23,7 +23,7 @@ class Node(object):
     portBase = 0
     def __init__(self, id,name=None, mac=None , is_core=False,
                  ip=None,position=None,direction=None,
-                 txpower=30,type='ibss',net_name=None):
+                 txpower=40,type='ibss',net_name=None):
         self.name = name if name else 'wlan' + str(id)
         self.intf_id = id
         self.intfs = {}
@@ -271,7 +271,7 @@ class Node(object):
         # 将 macs 转换为小写 set 以便快速查找
         target_macs = set(m.lower() for m in macs)
             
-        command = f"iw dev {self.name} station dump"
+        command = f"iw dev wlan{self.name} station dump"
         iw_output = self.cmd(command) # 这将使用 docker exec_run
         
         results = {}
@@ -316,63 +316,72 @@ class Node(object):
                         results[current_mac]['bitrate'] = bitrate
                     except (ValueError, IndexError):
                         pass # 解析 bitrate 失败
-
+        print(f"节点{self.name}的RSSI信息: {results}")
         return results
         
     def get_latency(self, ips):
         """
-        (MODIFIED)
-        运行 fping 并返回一个包含延迟和丢包的字典
-        格式: { 'ip': {'latency': 10.0, 'loss': 0.0}, ... }
-        不再修改 self.link_quality_history
+        运行 fping 并返回 { ip: {'latency': avg_ms, 'loss': loss_percent}, ... }
+        使用原始字符串（raw string）确保正则表达式正确。
         """
         if not ips:
             return {}
-        
+
         ip_list_str = ' '.join(ips)
-        # 关键: 我们需要 fping 的摘要 (在 stderr 上)
-        # 我们使用 2>&1 将 stderr 重定向到 stdout，以便 self.cmd() 可以捕获它
-        command = f"fping -c 3 -q -t 100 {ip_list_str} 2>&1"
-        
-        fping_output = self.cmd(command)
+        command = f"fping -c 5 -q {ip_list_str} 2>&1"
+        fping_output = ""
+        try:
+            fping_output = self.cmd(command)
+        except Exception as e:
+            print(f"[ERROR] 执行 fping 失败: {e}")
+
+        print(f"[DEBUG fping raw @{self.name}] cmd=`{command}`\n{fping_output}")
+
         results = {}
-
-        # fping -q 的摘要输出格式为:
-        # 10.10.10.1 : xmt/rcv/%loss = 3/3/0%, min/avg/max = 1.10/1.23/1.39
-        # 10.10.10.3 : xmt/rcv/%loss = 3/0/100%
-        
         for line in fping_output.splitlines():
-            if "loss" not in line:
+            line = line.strip()
+            if not line:
                 continue
 
-            parts = line.split()
-            if len(parts) < 5:
+            # 先取出 IP（格式: 10.10.10.1 : ...）
+            m_ip = re.match(r'(\d+\.\d+\.\d+\.\d+)\s*:', line)
+            if not m_ip:
                 continue
+            ip = m_ip.group(1)
 
-            ip = parts[0]
-            loss_percent = -1.0
+            loss = 100.0
             avg_latency = 9999.0
 
-            try:
-                # 解析 "xmt/rcv/%loss = 3/3/0%"
-                loss_str = parts[4].strip('%,')
-                loss_percent = float(loss_str)
-            except (ValueError, IndexError):
-                continue # 解析 loss 失败
+            # 尝试解析 xmt/rcv/%loss = 3/3/0% 这种字段
+            m_loss = re.search(r'xmt/rcv/%loss\s*=\s*\d+/\d+/(\d+)%', line)
+            if not m_loss:
+                # 备选：尝试捕获最后的百分比
+                m_loss = re.search(r'(\d+)/\d+/(\d+)%', line)
+                if m_loss:
+                    loss = float(m_loss.group(2))
+            else:
+                loss = float(m_loss.group(1))
 
-            # 如果可达 (loss < 100%)，则解析延迟
-            if loss_percent < 100.0 and len(parts) > 7:
+            # 修复：使用原始字符串 r"..." 避免反斜杠转义问题
+            # 格式: min/avg/max = 0.126/0.126/0.126
+            m_lat = re.search(r'min/avg/max\s*=\s*[\d\.]+/([\d\.]+)/', line)
+            if m_lat:
                 try:
-                    # 解析 "min/avg/max = 1.10/1.23/1.39"
-                    avg_latency = float(parts[7].split('/')[1])
-                except (ValueError, IndexError):
-                    # 无法解析 avg_latency，保持 9999.0
-                    pass
-            
-            results[ip] = {'latency': avg_latency, 'loss': loss_percent}
+                    avg_latency = float(m_lat.group(1))
+                except Exception as e:
+                    print(f"[WARN] 解析延迟失败: {e}")
+                    avg_latency = 9999.0
+            else:
+                print(f"[WARN] 未能匹配延迟正则，行为: {line}")
 
+            results[ip] = {'latency': avg_latency, 'loss': loss}
+
+        # 如果解析后全部都是 100% 丢包，打印提示
+        if results and all(v['loss'] >= 100.0 for v in results.values()):
+            print(f"[WARN] 节点{self.name} fping 全部 100% 丢包，需检查 ARP/路由/权限")
+
+        print(f"节点{self.name}的fping 信息: {results}")
         return results
-   
         
     # <--- MODIFIED: 新增函数，用于构建完整的状态向量 ---_>
     def get_link_quality_by_mac(self, target_mac):
