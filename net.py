@@ -417,16 +417,44 @@ class Net:
             dest_ip = dest_node.ip.split('/')[0]
             primary_hop_ip = primary_hop_node.ip.split('/')[0]
             backup_hop_ip = backup_hop_node.ip.split('/')[0]
-
-            if primary_hop_ip == core_node.ip.split('/')[0] or primary_hop_ip == dest_ip:
-                continue 
-
-            cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
-            core_node.cmd(cmd_primary)
             
-            if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_node.ip.split('/')[0] and backup_hop_ip != dest_ip:
-                cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
-                core_node.cmd(cmd_backup)
+            core_ip = core_node.ip.split('/')[0]
+            core_iface = core_node.name # 获取 wlan 接口名
+
+            # 1. 检查无效动作: 下一跳是自己
+            # (注意: ppoagent 里的掩码 应该已经阻止了_index，
+            #  但我们在这里检查 IP 作为双重保险)
+            if primary_hop_ip == core_ip:
+                continue # 非法动作，不安装路由 (agent 会得到坏奖励)
+
+            # 2. 检查有效动作: 下一跳是目的地 (直连路由)
+            elif primary_hop_ip == dest_ip:
+                # 这是最优的 1 跳直连路由
+                # 我们必须安装一个 'dev' 路由，而不是 'via' 路由
+                cmd_direct = f"ip route replace {dest_ip} dev wlan{core_iface} metric 10 proto 188"
+                core_node.cmd(cmd_direct)
+                
+            # 3. 检查有效动作: 下一跳是网关 (2跳路由)
+            else:
+                # 这是标准的 2 跳路由
+                cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
+                core_node.cmd(cmd_primary)
+
+                # 4. (可选) 安装备用路由
+                # 确保备用路由也不是自己或目的地
+                if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_ip and backup_hop_ip != dest_ip:
+                    cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
+                    core_node.cmd(cmd_backup)
+
+            # if primary_hop_ip == core_node.ip.split('/')[0] or primary_hop_ip == dest_ip:
+            #     continue 
+
+            # cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
+            # core_node.cmd(cmd_primary)
+            
+            # if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_node.ip.split('/')[0] and backup_hop_ip != dest_ip:
+            #     cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
+            #     core_node.cmd(cmd_backup)
 
     def end_test(self):
         self.cleanup_interfaces()
