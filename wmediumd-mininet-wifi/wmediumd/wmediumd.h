@@ -152,7 +152,7 @@ struct station {
 	u8 addr[ETH_ALEN];		/* virtual interface mac address */
 	u8 hwaddr[ETH_ALEN];		/* hardware address of hwsim radio */
 	double x, y, z;			/* position of the station [m] */
-	double dir_x, dir_y;		/* direction of the station [meter per MOVE_INTERVAL] */
+	double dir_x, dir_y,dir_z;		/* direction of the station [meter per MOVE_INTERVAL] */
 	int tx_power;			/* transmission power [dBm] */
 	int gain;			/* Antenna Gain [dBm] */
 	//int height;			/* Antenna Height [m] */
@@ -179,7 +179,7 @@ struct wmediumd {
 	double **station_err_matrix;
 	struct intf_info *intf;
 	struct timespec intf_updated;
-#define MOVE_INTERVAL	(3) /* station movement interval [sec] */
+#define MOVE_INTERVAL	(1) /* station movement interval [sec] */
 	struct timespec next_move;
 	void *path_loss_param;
 	float *per_matrix;

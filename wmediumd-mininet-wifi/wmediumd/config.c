@@ -320,6 +320,7 @@ static void move_stations_to_direction(struct wmediumd *ctx)
 	list_for_each_entry(station, &ctx->stations, list) {
 		station->x += station->dir_x;
 		station->y += station->dir_y;
+		station->z += station->dir_z;
 	}
 	recalc_path_loss(ctx);
 
