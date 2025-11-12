@@ -171,8 +171,8 @@ class PPOAgent:
         if len(self.memory) < self.batch_size:
             return 
         
-        batch = list(self.memory)
-        self.memory.clear() 
+        batch = random.sample(self.memory, self.batch_size)
+        # self.memory.clear() 
         
         # rewards_list 是 [batch, num_dests]
         states, actions, rewards_list, next_states, old_logprobs_list, dones = zip(*batch)
@@ -184,7 +184,7 @@ class PPOAgent:
         old_logprobs = torch.FloatTensor(old_logprobs_list) # [batch, num_dests, 2]
         dones = torch.FloatTensor(dones).unsqueeze(1)     # [batch, 1]
 
-        current_batch_size = states.shape(0)
+        current_batch_size = states.shape[0]
         
         actor_loss_total = 0
         critic_loss_total = 0

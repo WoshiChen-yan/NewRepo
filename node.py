@@ -316,7 +316,7 @@ class Node(object):
                         results[current_mac]['bitrate'] = bitrate
                     except (ValueError, IndexError):
                         pass # 解析 bitrate 失败
-        print(f"节点{self.name}的RSSI信息: {results}")
+        # print(f"节点{self.name}的RSSI信息: {results}")
         return results
         
     def get_latency(self, ips):
@@ -335,7 +335,7 @@ class Node(object):
         except Exception as e:
             print(f"[ERROR] 执行 fping 失败: {e}")
 
-        print(f"[DEBUG fping raw @{self.name}] cmd=`{command}`\n{fping_output}")
+        # print(f"[DEBUG fping raw @{self.name}] cmd=`{command}`\n{fping_output}")
 
         results = {}
         for line in fping_output.splitlines():
@@ -380,7 +380,7 @@ class Node(object):
         if results and all(v['loss'] >= 100.0 for v in results.values()):
             print(f"[WARN] 节点{self.name} fping 全部 100% 丢包，需检查 ARP/路由/权限")
 
-        print(f"节点{self.name}的fping 信息: {results}")
+        # print(f"节点{self.name}的fping 信息: {results}")
         return results
         
     # <--- MODIFIED: 新增函数，用于构建完整的状态向量 ---_>

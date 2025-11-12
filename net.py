@@ -56,9 +56,9 @@ class Net:
          self.node_dict = {} # <--- 方便按名称查找节点
          
          self.reward_history = {} # <--- 存储奖励历史用于绘图
-         self.batch_size = 1  # 收集32个时间步的数据后再学习
+         self.batch_size = 10  # 收集32个时间步的数据后再学习
          self.global_steps = 0 # 全局时间步计数器
-         self.agent_migration_interval = 1 # 每1个时间步迁移一次智能体
+         self.agent_migration_interval = 5 # 每1个时间步迁移一次智能体
 
          self.graph=nx.Graph(name=self.name)
          self.dqn_initialized=False
@@ -376,40 +376,62 @@ class Net:
     # --- (v5) 边缘路由逻辑 ---
     def apply_default_routing(self, edge_node):
         """
-        为边缘节点（非核心节点）设置简单的默认路由：
-        将所有流量路由到“邻居中”的“质量最好的”核心节点。
+        (v5 - MODIFIED)
+        为边缘节点（非核心节点）设置默认路由：
+        1. 优先路由到“邻居中”的“质量最好的”核心节点。
+        2. 如果没有核心邻居，则回退到路由到“质量最好的”*任何*邻居。
         """
         best_core_neighbor = None
-        best_quality = -float('inf')
-        best_rssi = -float('inf')
-
-        if not self.core_nodes:
-            return 
-
-        # 1. 寻找 *邻居中* 质量最好的 *核心节点*
-        neighbors = []
-        for n in self.nodes: # 检查所有节点
-             if n == edge_node: continue
-             
-             link_info = edge_node.get_link_quality_by_mac(n.mac)
-             if link_info and link_info['rssi'] > -100: # 必须是可达的邻居
-                 neighbors.append((n, link_info))
+        best_core_rssi = -float('inf')
         
+        best_neighbor = None
+        best_neighbor_rssi = -float('inf')
+
+        # 1. 寻找所有可达邻居
+        neighbors = []
+        for n in self.nodes: 
+            if n == edge_node: continue
+            
+            link_info = edge_node.get_link_quality_by_mac(n.mac)
+            # 必须是可达的邻居 (rssi > -100 且 loss < 100)
+            if link_info and link_info.get('rssi', -100) > -100 and link_info.get('loss', 100) < 100: 
+                neighbors.append((n, link_info))
+        
+        # 2. 遍历邻居，寻找最佳核心节点和最佳(回退)邻居
         for neighbor_node, link_info in neighbors:
-            if neighbor_node in self.core_nodes: # 如果这个邻居是核心节点
-                # quality = self._calculate_reward_from_link(link_info)
-                rssi=link_info.get('rssi', -100)
-                
-                if rssi > best_rssi:
-                    best_rssi=rssi
+            rssi = link_info.get('rssi', -100)
+            
+            # 检查是否是最佳邻居 (回退选项)
+            if rssi > best_neighbor_rssi:
+                best_neighbor_rssi = rssi
+                best_neighbor = neighbor_node
+            
+            # 检查是否是最佳 *核心* 邻居 (优先选项)
+            if neighbor_node in self.core_nodes: 
+                if rssi > best_core_rssi:
+                    best_core_rssi = rssi
                     best_core_neighbor = neighbor_node
         
-        # 2. 下发默认路由
-        edge_node.cmd("ip route flush table main") 
+        # 3. 下发默认路由
+        # 使用 proto 189 以区别于核心路由 (188)
+        # 我们只管理 default 路由，不flush table main，避免删除本地/链路路由
+        
         if best_core_neighbor:
+            # 优先：路由到最佳核心邻居
             core_ip = best_core_neighbor.ip.split('/')[0]
-            edge_node.cmd(f"ip route replace default via {core_ip} ")
-
+            edge_node.cmd(f"ip route replace default via {core_ip} dev wlan{edge_node.name} proto 189")
+        elif best_neighbor:
+            # 回退：路由到最佳邻居 (它可能知道如何去核心)
+            neighbor_ip = best_neighbor.ip.split('/')[0]
+            edge_node.cmd(f"ip route replace default via {neighbor_ip} dev wlan{edge_node.name} proto 189")
+        else:
+            # 孤立：没有邻居，清除旧的默认路由，防止路由循环
+            try:
+                # 只删除我们自己（proto 189）添加的路由
+                edge_node.cmd(f"ip route del default proto 189")
+            except Exception as e:
+                pass # 忽略错误 (例如路由不存在)
+            print(f"[WARN] Edge node {edge_node.name} has no neighbors. Default route removed.")
 
     # --- (v5) 核心路由应用 ---
     def apply_node_routing(self, core_node, actions_matrix):
@@ -637,18 +659,50 @@ class Net:
                     if target_node == node: continue
                     link_info = node.get_link_quality_by_mac(target_node.mac)
                     # 优质邻居：丢包 <  且 延迟 < ms
-                    # if link_info and link_info['loss'] < 80 and link_info['latency'] < 200:
-                    #     score += 1
-                    rssi = link_info.get('rssi', -100)
-                    if rssi > -80:
-                    # if link_info and link_info['loss'] < 20 and link_info['latency'] < 100: # <-- (这是错误的代码)
-                        score += 1
-                    print(f"    节点 {node.name} 到 {target_node.name} 的链路信息: {link_info}, 当前得分: {score}")  
+                    
+                    # --- 新的多指标评分逻辑 ---
+                    rssi = link_info.get('rssi', -100.0)
+                    loss = link_info.get('loss', 100.0)
+                    latency = link_info.get('latency', 9999.0)
+
+                    link_score = 0.0
+                    
+                    # 1. 主要指标: RSSI (基础分)
+                    # 我们只考虑 RSSI > -85dBm 的邻居
+                    RSSI_THRESHOLD_BASE = -85.0
+                    if rssi > RSSI_THRESHOLD_BASE:
+                        # 将 -85dBm 映射到 0 分, -60dBm 映射到 25 分, -50dBm 映射到 35 分
+                        # 这是一个非线性的基础分，奖励强信号
+                        link_score = (rssi - RSSI_THRESHOLD_BASE) # 例如: -70dBm -> 15 分
+
+                    # 2. 次要指标: Loss 和 Latency (奖励分)
+                    # 只有当 RSSI 已经很好时 (例如 > -65dBm)，才激活辅助指标
+                    RSSI_THRESHOLD_GOOD = -65.0
+                    if rssi > RSSI_THRESHOLD_GOOD:
+                        
+                        # 奖励1: 低丢包 (0% loss = +10 分, 50% loss = +5 分)
+                        loss_bonus = (100.0 - loss) / 10.0 
+                        
+                        # 奖励2: 低延迟 (<50ms = +10 分, <200ms = +5 分)
+                        lat_bonus = 0.0
+                        if latency < 50.0:
+                            lat_bonus = 10.0
+                        elif latency < 200.0:
+                            lat_bonus = 5.0
+                        
+                        # 只有当链路质量好时，才增加这些奖励
+                        link_score += (loss_bonus + lat_bonus)
+            
+                    # (调试日志)
+                    print(f"    节点 {node.name} -> {target_node.name} [RSSI:{rssi:.1f}, Loss:{loss:.1f}, Lat:{latency:.1f}] => Link Score: {link_score:.2f}")  
+                    score += link_score
                     
             except Exception as e:
                 print(f"  获取 {node.name} 邻居失败: {e}")
                 score = 0
-            node_scores[node.name] = score
+            
+            node_scores[node.name] = score # 节点总分是所有链路得分之和
+        
         
         # 2. 选择 Top 30% 节点
         num_core = max(1, int(len(self.nodes) * num_nodes_rate))
@@ -981,7 +1035,7 @@ class Net:
                 target= self.nodes[j]
                 self.plot_node_link_quality(src.name, target.name)
             
-    def plot_reward_history(self, save_path="test/reward_history.png"):
+    def plot_reward_history(self, save_path="test1/reward_history.png"):
         plt.figure(figsize=(15, 8))
         
         all_rewards = [] 
