@@ -56,7 +56,7 @@ class Net:
          self.node_dict = {} # <--- 方便按名称查找节点
          
          self.reward_history = {} # <--- 存储奖励历史用于绘图
-         self.batch_size = 2  # 收集32个时间步的数据后再学习
+         self.batch_size = 1  # 收集32个时间步的数据后再学习
          self.global_steps = 0 # 全局时间步计数器
          self.agent_migration_interval = 1 # 每1个时间步迁移一次智能体
 
@@ -636,9 +636,15 @@ class Net:
                 for target_node in self.nodes:
                     if target_node == node: continue
                     link_info = node.get_link_quality_by_mac(target_node.mac)
-                    # 优质邻居：丢包 < 20% 且 延迟 < 100ms
-                    if link_info and link_info['loss'] < 80 and link_info['latency'] < 200:
+                    # 优质邻居：丢包 <  且 延迟 < ms
+                    # if link_info and link_info['loss'] < 80 and link_info['latency'] < 200:
+                    #     score += 1
+                    rssi = link_info.get('rssi', -100)
+                    if rssi > -80:
+                    # if link_info and link_info['loss'] < 20 and link_info['latency'] < 100: # <-- (这是错误的代码)
                         score += 1
+                    print(f"    节点 {node.name} 到 {target_node.name} 的链路信息: {link_info}, 当前得分: {score}")  
+                    
             except Exception as e:
                 print(f"  获取 {node.name} 邻居失败: {e}")
                 score = 0
