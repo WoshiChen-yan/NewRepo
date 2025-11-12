@@ -56,7 +56,7 @@ class Net:
          self.node_dict = {} # <--- 方便按名称查找节点
          
          self.reward_history = {} # <--- 存储奖励历史用于绘图
-         self.batch_size = 32  # 收集32个时间步的数据后再学习
+         self.batch_size = 2  # 收集32个时间步的数据后再学习
          self.global_steps = 0 # 全局时间步计数器
          self.agent_migration_interval = 1 # 每1个时间步迁移一次智能体
 
@@ -175,18 +175,21 @@ class Net:
         time.sleep(8)
         
     
-    def move_nodes(self):
+    def move_nodes(self,inter):
+        if not inter:
+            inter=self.interval
         for node in self.nodes:
             x,y,z=node.position
             dx,dy,dz=node.direction
             
-            new_x=x+dx*self.interval
-            new_y=y+dy*self.interval
-            new_z=z+dz*self.interval
+            new_x=x+dx*inter
+            new_y=y+dy*inter
+            new_z=z+dz*inter
             
-            node.position=(new_x,new_y,new_z)
-            self.graph.nodes[node.name]['position']=(new_x,new_y,new_z)
-            print(f"节点'{node.name}'位置已更新为: {node.position}")
+            node.position = (new_x, new_y, new_z)
+            node.position = (round(new_x, 1), round(new_y, 1), round(new_z, 1))
+            self.graph.nodes[node.name]['position'] = (round(new_x, 1), round(new_y, 1), round(new_z, 1))
+            print(f"节点'{node.name}'位置已更新为: ({node.position[0]:.1f}, {node.position[1]:.1f}, {node.position[2]:.1f})")
          
     
     
@@ -351,11 +354,23 @@ class Net:
             agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
             
         # --- 步骤 5: 触发全局学习 ---
-        if self.global_steps % self.batch_size == 0 and self.global_steps > 0:
-            print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+        if self.global_steps > self.batch_size: 
+            # (可选) 打印日志，避免刷屏
+            if self.global_steps % 10 == 0: # 每 10 步打印一次
+                print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+
             for agent in self.node_agents.values():
-                agent.learn()
-            print("--- [学习步骤完成] ---\n")
+                # agent.learn() 现在会从 replay buffer 采样
+                agent.learn() 
+
+            if self.global_steps % 10 == 0:
+                print("--- [学习步骤完成] ---\n")
+    
+        # if self.global_steps % self.batch_size == 0 and self.global_steps > 0:
+        #     print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+        #     for agent in self.node_agents.values():
+        #         agent.learn()
+        #     print("--- [学习步骤完成] ---\n")
             
     
     # --- (v5) 边缘路由逻辑 ---
@@ -366,6 +381,7 @@ class Net:
         """
         best_core_neighbor = None
         best_quality = -float('inf')
+        best_rssi = -float('inf')
 
         if not self.core_nodes:
             return 
@@ -374,16 +390,18 @@ class Net:
         neighbors = []
         for n in self.nodes: # 检查所有节点
              if n == edge_node: continue
+             
              link_info = edge_node.get_link_quality_by_mac(n.mac)
-             if link_info and link_info['loss'] < 100: # 必须是可达的邻居
+             if link_info and link_info['rssi'] > -100: # 必须是可达的邻居
                  neighbors.append((n, link_info))
         
         for neighbor_node, link_info in neighbors:
             if neighbor_node in self.core_nodes: # 如果这个邻居是核心节点
-                quality = self._calculate_reward_from_link(link_info)
+                # quality = self._calculate_reward_from_link(link_info)
+                rssi=link_info.get('rssi', -100)
                 
-                if quality > best_quality:
-                    best_quality = quality
+                if rssi > best_rssi:
+                    best_rssi=rssi
                     best_core_neighbor = neighbor_node
         
         # 2. 下发默认路由
