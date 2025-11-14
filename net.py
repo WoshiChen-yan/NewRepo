@@ -28,10 +28,11 @@ class Net:
          self.current_node_id=0
          self.interval=interval #default interval=1
          self.nodes=[]#用于存储节点
-         
+         self.all_node_agents={}#用于存储所有节点的智能体
          
          self.core_nodes=[]#用于存储核心节点
          self.node_agents={}#用于存储核心节点的智能体
+         self.edge_nodes=[]#用于存储边缘节点
          
           # --- 局部状态和动作空间 ---
          
@@ -56,9 +57,15 @@ class Net:
          self.node_dict = {} # <--- 方便按名称查找节点
          
          self.reward_history = {} # <--- 存储奖励历史用于绘图
-         self.batch_size = 10  # 收集32个时间步的数据后再学习
+         self.batch_size = 5  # 收集5个时间步的数据后再学习
          self.global_steps = 0 # 全局时间步计数器
-         self.agent_migration_interval = 5 # 每1个时间步迁移一次智能体
+         self.agent_migration_interval = 10 # 每10个时间步迁移一次智能体
+         
+         # 2. (新) 保留事件触发器
+         self.avg_core_reward_history = []
+         self.reelection_trigger_threshold = -2.0 # (可调) 当核心平均奖励低于-2.0
+         self.reelection_patience = 3          # (可调) 连续 3 次低于阈值
+         self.bad_network_health_counter = 0   # 内部计数器
 
          self.graph=nx.Graph(name=self.name)
          self.dqn_initialized=False
@@ -258,120 +265,158 @@ class Net:
             return -5.0
             
         return reward
-
     
-    # --- MODIFIED (v6): 核心训练逻辑重构 ---
+    def initialize_agents_and_elect(self):
+            """
+            
+            在网络启动时调用一次。
+            1. 创建共享的 Critic。
+            2. 为 *所有* 节点创建 PPOAgent (Actor) 并永久存储。
+            3. 运行一次 `select_core_nodes_distributed` 来选举 *初始* 核心节点。
+            """
+            print("\n=== (v0.2.0) 初始化所有节点的永久智能体 ===")
+
+            # 1. 确保全局参数已设置
+            if self.state_dim <= 0:
+                print("错误：状态维度为0，无法创建智能体。")
+                return
+
+            # 2. 创建共享 Critic
+            if not self.global_critic:
+                print("  创建共享 Critic...")
+                self.global_critic = PPOCritic(self.state_dim, self.num_dests, self.gru_hidden_dim, self.dest_embedding_dim)
+                self.global_critic_optimizer = torch.optim.Adam(self.global_critic.parameters(), lr=1e-3)
+
+            # 3. 为 *每个* 节点创建并存储一个永久的 PPOAgent
+            for node in self.nodes:
+                if node.name not in self.all_node_agents:
+                    self.reward_history[node.name] = {} # 初始化奖励历史
+                    
+                    agent = PPOAgent(
+                        state_dim=self.state_dim,
+                        num_dests=self.num_dests,
+                        num_next_hops=self.num_next_hops,
+                        gru_hidden_dim=self.gru_hidden_dim,
+                        dest_embedding_dim=self.dest_embedding_dim,
+                        critic=self.global_critic, # 传入共享 Critic
+                        critic_optimizer=self.global_critic_optimizer,
+                        batch_size=self.batch_size 
+                    )
+                    self.all_node_agents[node.name] = agent
+                    print(f"  已为节点 {node.name} 创建永久 PPO 智能体。")
+            
+            # 4. 运行一次初始选举
+            print("  执行初始核心节点选举...")
+            self.test_all_links_concurrent() # 选举前需要链路数据
+            self.select_core_nodes_distributed(num_nodes_rate=0.3) # 选举
+        
+    # ---  心训练逻辑重构 ---
     def update_routing(self):
         """
-        (v6)
-        执行一个完整的 决策 -> 执行 -> 测量 -> 学习 循环
-        以解决“奖励近视”问题
+        (v0.2.0)
+        执行: 决策(所有) -> 执行(区分) -> 测量 -> 存储(所有) -> 学习(核心) -> 健康检查
         """
         
-        all_actions_for_all_nodes = {} 
-        all_transitions = {} # 临时存储 (S, A, logP)
+        all_actions_to_execute = {} # 仅用于核心节点
+        all_transitions = {}      # 用于所有节点 (S, A, logP)
         
-        # --- 步骤 1: 决策 (所有核心节点) ---
-        # (基于 S_t 决定 A_t)
-        for core_node in self.core_nodes: 
-            agent = self.node_agents.get(core_node.name)
-            if not agent:
-                continue 
+        # --- 步骤 1: 决策 (所有节点都"思考", 保证边缘节点也能存储经验) ---
+        for node in self.nodes: 
+            agent = self.all_node_agents.get(node.name)
+            if not agent: continue 
             
-            node_index = self.nodes.index(core_node)
-            
-            # 1a. 获取局部状态 S_t
-            state_seq, neighbor_map_indices = self.get_state_sequence(core_node.name)
-        
-            # 1b. 智能体选择动作 A_t
+            node_index = self.nodes.index(node)
+            state_seq, neighbor_map_indices = self.get_state_sequence(node.name)
             actions, old_logprobs = agent.select_action(state_seq, node_index, neighbor_map_indices)
             
-            # 1c. 存储决策，稍后执行
-            all_actions_for_all_nodes[core_node.name] = actions
-            
-            # 1d. 存储经验的前半部分
-            all_transitions[core_node.name] = (state_seq, actions, old_logprobs)
+            all_transitions[node.name] = (state_seq, actions, old_logprobs)
 
+            # (关键) 只存储 *核心节点* 的动作, 用于执行
+            if node in self.core_nodes:
+                all_actions_to_execute[node.name] = actions
             
-        # --- 步骤 2: 执行 (所有节点) ---
-        # (应用 A_t 到环境中)
-        
-        # 2a. 应用核心节点的 PPO 路由
-        for node_name, node_actions in all_actions_for_all_nodes.items():
+        # --- 步骤 2: 执行 (核心节点PPO, 边缘节点默认) ---
+        for node_name, node_actions in all_actions_to_execute.items():
             core_node = self.node_dict[node_name]
-            self.apply_node_routing(core_node, node_actions) # 下发 ip route
+            self.apply_node_routing(core_node, node_actions) 
 
-        # 2b. 应用边缘节点的默认路由
-        for node in self.nodes:
-            if node not in self.core_nodes:
-                self.apply_default_routing(node)
+        for edge_node in self.edge_nodes:
+            self.apply_default_routing(edge_node)
         
-        # (给路由一个极短的时间生效)
         time.sleep(0.1) 
             
         # --- 步骤 3: 测量 (获取 E2E 结果) ---
-        # (运行 fping 来测量 A_t 导致的端到端结果 R_t)
         self.test_all_links_concurrent()
         
         
-        # --- 步骤 4: 学习 (所有核心节点) ---
+        # --- 步骤 4: 收集经验 (所有节点) ---
         self.global_steps += 1
+        current_step_core_rewards = [] # 用于健康检查
         
-        for core_node in self.core_nodes:
-            agent = self.node_agents.get(core_node.name)
-            if not agent:
+        for node in self.nodes:
+            agent = self.all_node_agents.get(node.name)
+            if not agent or node.name not in all_transitions:
                 continue
 
-            # 4a. 取出经验的前半部分 (S_t, A_t, logP_t)
-            (state_seq, actions, old_logprobs) = all_transitions[core_node.name]
-            
-            # 4b. 获取新状态 S_{t+1}
-            new_state_seq, _ = self.get_state_sequence(core_node.name)
+            (state_seq, actions, old_logprobs) = all_transitions[node.name]
+            new_state_seq, _ = self.get_state_sequence(node.name)
             done = False 
 
-            # 4c. 计算 *端到端* 奖励 R_t
             rewards_list = []
             for dest_index in range(self.num_dests):
                 dest_node = self.nodes[dest_index]
-                if dest_node == core_node:
-                    rewards_list.append(0) # 到自己的奖励为0
+                if dest_node == node:
+                    rewards_list.append(0) 
                     continue
                 
-                # --- 这是关键修正 ---
-                # 直接查找 core_node -> dest_node 的 E2E fping 结果
-                e2e_link_info = core_node.get_link_quality_by_mac(dest_node.mac)
+                e2e_link_info = node.get_link_quality_by_mac(dest_node.mac)
                 reward = self._calculate_reward_from_link(e2e_link_info)
-                # --- 修正结束 ---
-                
                 rewards_list.append(reward)
                 
-                # 记录奖励 (用于绘图)
-                if dest_node.name not in self.reward_history[core_node.name]:
-                    self.reward_history[core_node.name][dest_node.name] = []
-                self.reward_history[core_node.name][dest_node.name].append(reward)
+                if dest_node.name not in self.reward_history[node.name]:
+                    self.reward_history[node.name][dest_node.name] = []
+                self.reward_history[node.name][dest_node.name].append(reward)
 
-            # 4d. 存储完整的经验 (S_t, A_t, R_t, S_{t+1})
+            # (关键) 所有节点都 *存储* 经验, 保证数据是最新的
             agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
             
-        # --- 步骤 5: 触发全局学习 ---
-        if self.global_steps > self.batch_size: 
-            # (可选) 打印日志，避免刷屏
-            if self.global_steps % 10 == 0: # 每 10 步打印一次
-                print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
+            if node in self.core_nodes and rewards_list:
+                current_step_core_rewards.append(np.mean(rewards_list))
 
-            for agent in self.node_agents.values():
-                # agent.learn() 现在会从 replay buffer 采样
-                agent.learn() 
+        # --- 步骤 5: 触发全局学习 (v0.2.0 优化: 只学习核心节点) ---
+        if self.global_steps > self.batch_size: 
+            if self.global_steps % 10 == 0: 
+                print(f"\n--- [全局学习步骤 {self.global_steps} (仅核心节点)] ---")
+
+            # (!!!) 优化点: 只训练核心节点以节省时间
+            for core_node in self.core_nodes:
+                agent = self.all_node_agents.get(core_node.name)
+                if agent:
+                    # 智能体内部会检查 memory > batch_size
+                    agent.learn() 
 
             if self.global_steps % 10 == 0:
                 print("--- [学习步骤完成] ---\n")
-    
-        # if self.global_steps % self.batch_size == 0 and self.global_steps > 0:
-        #     print(f"\n--- [全局学习步骤 {self.global_steps}] ---")
-        #     for agent in self.node_agents.values():
-        #         agent.learn()
-        #     print("--- [学习步骤完成] ---\n")
+        
+        # --- 步骤 6 (v0.2.0): 检查网络健康并触发 (事件触发) ---
+        if current_step_core_rewards:
+            avg_reward = np.mean(current_step_core_rewards)
+            self.avg_core_reward_history.append(avg_reward)
             
+            if avg_reward < self.reelection_trigger_threshold:
+                self.bad_network_health_counter += 1
+                print(f"  [健康检查] 网络平均奖励 {avg_reward:.2f} (低于 {self.reelection_trigger_threshold}), 差评计数: {self.bad_network_health_counter}/{self.reelection_patience}")
+            else:
+                if self.bad_network_health_counter > 0:
+                     print(f"  [健康检查] 网络平均奖励 {avg_reward:.2f}, 恢复正常。")
+                self.bad_network_health_counter = 0 
+
+            # (新) 事件触发重选举
+            if self.bad_network_health_counter >= self.reelection_patience:
+                print(f"  [!!! 事件触发] 网络健康度连续 {self.reelection_patience} 次不佳, 触发核心节点重选举!")
+                self.test_all_links_concurrent() 
+                self.select_core_nodes_distributed(num_nodes_rate=0.3)
+                # (选举函数在内部会重置计数器)
     
     # --- (v5) 边缘路由逻辑 ---
     def apply_default_routing(self, edge_node):
@@ -638,120 +683,72 @@ class Net:
             print(f"[ERROR] 写入 wmediumd 配置失败: {e}")
 
     
-    
-   
-
     def select_core_nodes_distributed(self, num_nodes_rate=0.3):
         """
-        (v5)
-        根据局部邻居质量选择核心节点，并动态迁移智能体。
+        (v0.2.0)
+        根据局部邻居质量选择核心节点。
+        (关键) 此函数不再创建或销毁智能体, 仅更新 self.core_nodes 和 self.edge_nodes 列表。
         """
-        print(f"\n--- [分布式核心节点选择 步骤 {self.global_steps}] ---")
+        print(f"\n--- [核心节点重选举 步骤 {self.global_steps}] ---")
         
         node_scores = {}
         
-        # 1. 计算每个节点的“局部中心性”得分
+        # 1. 计算每个节点的“局部中心性”得分 (使用您上次的多指标评分)
         for node in self.nodes:
-            score = 0
+            score = 0.0 # 使用浮点数
             try:
-                # MODIFIED: 使用 get_link_quality_by_mac 替代 get_neighbor
                 for target_node in self.nodes:
                     if target_node == node: continue
                     link_info = node.get_link_quality_by_mac(target_node.mac)
-                    # 优质邻居：丢包 <  且 延迟 < ms
-                    
-                    # --- 新的多指标评分逻辑 ---
+                    if not link_info: continue
+
+                    # --- 多指标评分逻辑 ---
                     rssi = link_info.get('rssi', -100.0)
                     loss = link_info.get('loss', 100.0)
                     latency = link_info.get('latency', 9999.0)
-
                     link_score = 0.0
                     
-                    # 1. 主要指标: RSSI (基础分)
-                    # 我们只考虑 RSSI > -85dBm 的邻居
                     RSSI_THRESHOLD_BASE = -85.0
                     if rssi > RSSI_THRESHOLD_BASE:
-                        # 将 -85dBm 映射到 0 分, -60dBm 映射到 25 分, -50dBm 映射到 35 分
-                        # 这是一个非线性的基础分，奖励强信号
-                        link_score = (rssi - RSSI_THRESHOLD_BASE) # 例如: -70dBm -> 15 分
-
-                    # 2. 次要指标: Loss 和 Latency (奖励分)
-                    # 只有当 RSSI 已经很好时 (例如 > -65dBm)，才激活辅助指标
+                        # 基础分: RSSI 越高分越高
+                        link_score = (rssi - RSSI_THRESHOLD_BASE) # e.g., -70dBm -> 15 分
+                    
                     RSSI_THRESHOLD_GOOD = -65.0
                     if rssi > RSSI_THRESHOLD_GOOD:
-                        
-                        # 奖励1: 低丢包 (0% loss = +10 分, 50% loss = +5 分)
-                        loss_bonus = (100.0 - loss) / 10.0 
-                        
-                        # 奖励2: 低延迟 (<50ms = +10 分, <200ms = +5 分)
+                        # 奖励分: 信号好时, 额外奖励低丢包和低延迟
+                        loss_bonus = (100.0 - loss) / 10.0 # 0% loss = +10 分
                         lat_bonus = 0.0
-                        if latency < 50.0:
-                            lat_bonus = 10.0
-                        elif latency < 200.0:
-                            lat_bonus = 5.0
-                        
-                        # 只有当链路质量好时，才增加这些奖励
+                        if latency < 50.0: lat_bonus = 10.0
+                        elif latency < 200.0: lat_bonus = 5.0
                         link_score += (loss_bonus + lat_bonus)
-            
-                    # (调试日志)
-                    print(f"    节点 {node.name} -> {target_node.name} [RSSI:{rssi:.1f}, Loss:{loss:.1f}, Lat:{latency:.1f}] => Link Score: {link_score:.2f}")  
+                    # --- 评分逻辑结束 ---
+                    
                     score += link_score
                     
             except Exception as e:
                 print(f"  获取 {node.name} 邻居失败: {e}")
                 score = 0
             
-            node_scores[node.name] = score # 节点总分是所有链路得分之和
+            node_scores[node.name] = score 
         
-        
-        # 2. 选择 Top 30% 节点
+        # 2. 选择 Top N% 节点
         num_core = max(1, int(len(self.nodes) * num_nodes_rate))
         sorted_nodes = sorted(node_scores.items(), key=lambda item: item[1], reverse=True)
+        
         new_core_node_names = {name for name, score in sorted_nodes[:num_core]}
-        
-        old_core_node_names = set(self.node_agents.keys())
-        
-        print(f"  局部得分排名: {sorted_nodes}")
-        print(f"  原核心节点: {old_core_node_names}")
-        print(f"  新核心节点 (Top {num_core}): {new_core_node_names}")
-        
-        # 3. 初始化共享 Critic (如果不存在)
-        if not self.global_critic:
-            print("  创建共享 Critic (v5)...")
-            self.global_critic = PPOCritic(self.state_dim, self.num_dests, self.gru_hidden_dim, self.dest_embedding_dim)
-            self.global_critic_optimizer = torch.optim.Adam(self.global_critic.parameters(), lr=1e-3)
+        new_edge_node_names = {name for name, score in sorted_nodes[num_core:]}
 
-        # 4. 智能体迁移
-        # 4a. 销毁下线的智能体
-        nodes_to_remove = old_core_node_names - new_core_node_names
-        for node_name in nodes_to_remove:
-            if node_name in self.node_agents:
-                del self.node_agents[node_name]
-                del self.reward_history[node_name]
-                print(f"  [迁移] 销毁节点 {node_name} 的智能体。")
-
-        # 4b. 创建上线的智能体
-        nodes_to_add = new_core_node_names - old_core_node_names
-        for node_name in nodes_to_add:
-            core_node = self.node_dict[node_name]
-            self.reward_history[core_node.name] = {}
-            
-            agent = PPOAgent(
-                state_dim=self.state_dim,
-                num_dests=self.num_dests,
-                num_next_hops=self.num_next_hops,
-                gru_hidden_dim=self.gru_hidden_dim,
-                dest_embedding_dim=self.dest_embedding_dim,
-                critic=self.global_critic, # 传入共享 Critic
-                critic_optimizer=self.global_critic_optimizer,
-                batch_size=self.batch_size 
-            )
-            self.node_agents[node_name] = agent
-            print(f"  [迁移] 已为新核心节点 {node_name} 创建 PPO 智能体。")
-        
-        # 5. 更新核心节点列表
+        # 3. (关键) 更新动态列表 (不再创建/删除智能体)
         self.core_nodes = [self.node_dict[name] for name in new_core_node_names]
+        self.edge_nodes = [self.node_dict[name] for name in new_edge_node_names]
          
+        # 4. 重置健康检查计数器 (因为刚选举完)
+        self.bad_network_health_counter = 0
+        
+        print(f"  局部得分排名: {[(n, f'{s:.2f}') for n, s in sorted_nodes]}")
+        print(f"  (v0.2.0) 重选举完成: ")
+        print(f"  新核心节点 (Top {num_core}): {[n.name for n in self.core_nodes]}")
+        print(f"  新边缘节点: {[n.name for n in self.edge_nodes]}")
                     
     # 取消注释 select_core_nodes 并实现 PPOAgent 的创建 ---_>
     def select_core_nodes(self, num_nodes_rate=0.3):
@@ -1035,7 +1032,7 @@ class Net:
                 target= self.nodes[j]
                 self.plot_node_link_quality(src.name, target.name)
             
-    def plot_reward_history(self, save_path="test1/reward_history.png"):
+    def plot_reward_history(self, save_path="test/reward_history.png"):
         plt.figure(figsize=(15, 8))
         
         all_rewards = [] 
