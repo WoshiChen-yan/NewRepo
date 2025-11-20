@@ -263,7 +263,7 @@ class Net:
         
         if latency >= 9999.0 or (loss == 100.0 and latency > 1000):
             return -5.0
-            
+        print(f"链路奖励计算: 延迟={latency}ms, 丢包={loss}%, 奖励={reward:.2f}") 
         return reward
     
     def initialize_agents_and_elect(self):
@@ -376,6 +376,7 @@ class Net:
                 if dest_node.name not in self.reward_history[node.name]:
                     self.reward_history[node.name][dest_node.name] = []
                 self.reward_history[node.name][dest_node.name].append(reward)
+                
 
             # (关键) 所有节点都 *存储* 经验, 保证数据是最新的
             agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
@@ -961,19 +962,22 @@ class Net:
                 subprocess.call(cmd, shell=True)
                 print(f"[TC] {iface}: 带宽={bandwidth}Mbit 延迟={delay}ms 丢包={loss}% ({src.name}->{dst.name})")
     
-    def plot_node_link_quality(self,src_node_name=None,target_node_name=None,save_path=None):
+    def plot_node_link_quality(self, src_node_name=None, target_node_name=None, save_path=None,
+                              rssi_range=None, bitrate_range=None, loss_range=None, latency_range=None):
         times = []
         rssis = []
         bitrates = []
-        loss=[]
-        latency=[]
-        exec_times=[]
+        loss = []
+        latency = []
+        exec_times = []
         
         src_node = self.node_dict.get(src_node_name)
         if not src_node:
             print(f"未找到节点 {src_node_name}")
             return
             
+        # 收集所有历史记录
+        all_records = []
         for record in src_node.link_quality_history:
             if record['target'] == target_node_name:
                 times.append(record['time'])
@@ -981,56 +985,206 @@ class Net:
                 bitrates.append(record['bitrate'])
                 loss.append(record['loss'])
                 latency.append(record['latency'])
+                all_records.append(record)
                 
         if not times:
             print(f"节点 {src_node_name} 到 {target_node_name} 无链路数据")
             return
-            
+        
+        # 保存原始数据到CSV文件（最适合数据分析）
+        self._save_link_quality_csv(src_node_name, target_node_name, all_records)
+        
         plt.figure(figsize=(16,14))
         plt.subplot(4,1,1)
         plt.plot(times, rssis, marker='o')
         plt.title(f"Node {src_node.name} to Node{target_node_name} RSSI over time")
         plt.ylabel("RSSI (dBm)")
         plt.xlabel("Time")
+        if rssi_range:
+            plt.ylim(rssi_range)
         
         plt.subplot(4,1,2)
         plt.plot(times, bitrates, marker='o', color='orange')
         plt.title(f"Node {src_node.name} to Node{ target_node_name} Bitrate over time")
         plt.ylabel("Bitrate (Mbps)")
         plt.xlabel("Time")
+        if bitrate_range:
+            plt.ylim(bitrate_range)
         
         plt.subplot(4,1,3)
         plt.plot(times, loss, marker='o', color='red')
         plt.title(f"Node {src_node.name} to Node{ target_node_name} Packet Loss over time")
         plt.ylabel("Loss (%)")
         plt.xlabel("Time")
+        if loss_range:
+            plt.ylim(loss_range)
         
         plt.subplot(4,1,4)
         plt.plot(times, latency, marker='o', color='green') 
         plt.title(f"Node {src_node.name} to Node{ target_node_name} Latency over time")
         plt.ylabel("Latency (ms)")
         plt.xlabel("Time")
+        if latency_range:
+            plt.ylim(latency_range)
         
         plt.tight_layout()
         if save_path:
-            plt.savefig(save_path)
-            print(f"图已保存到: {save_path}")
+            output_path= save_path + f" {src_node_name} -> {target_node_name} link quality.png"
+            plt.savefig(output_path)
+            print(f"图已保存到: {output_path}")
+            
         else:
-            # 确保 test 目录存在
             subprocess.run(["mkdir", "-p", "test"])
-            plt.savefig(f"test/{src_node_name} -> {target_node_name} link quality.png")
             output_path=f"test/{src_node_name} -> {target_node_name} link quality.png"
             plt.savefig(output_path)
             print(f"图已保存到: {output_path}")
-        plt.close() 
+        plt.close()
+    
+    def _save_link_quality_csv(self, src_node_name, target_node_name, records):
+        """保存链路质量数据到CSV文件（最适合数据分析）"""
+        import csv
+        from datetime import datetime
+        
+        # 确保test目录存在
+        subprocess.run(["mkdir", "-p", "test"])
+        
+        # 生成时间戳
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # CSV文件名
+        csv_filename = f"test/{src_node_name}_to_{target_node_name}_data_{timestamp}.csv"
+        
+        with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头（包含所有重要字段）
+            writer.writerow([
+                'record_id',           # 记录ID
+                'timestamp',           # 数据生成时间戳
+                'measurement_time',    # 测量时间
+                'src_node',           # 源节点
+                'target_node',        # 目标节点
+                'rssi_dbm',           # RSSI信号强度
+                'bitrate_mbps',       # 比特率
+                'loss_percent',       # 丢包率
+                'latency_ms',         # 延迟
+                'target_mac',         # 目标MAC地址
+                'target_ip'           # 目标IP地址
+            ])
             
-    def plot_all_nodes(self):
+            # 写入数据行
+            for i, record in enumerate(records):
+                writer.writerow([
+                    i + 1,                           # 记录ID
+                    timestamp,                       # 数据生成时间戳
+                    record.get('time', ''),          # 测量时间
+                    src_node_name,                   # 源节点
+                    target_node_name,                # 目标节点
+                    record.get('rssi', ''),         # RSSI信号强度
+                    record.get('bitrate', ''),       # 比特率
+                    record.get('loss', ''),          # 丢包率
+                    record.get('latency', ''),       # 延迟
+                    record.get('mac', ''),           # 目标MAC地址
+                    record.get('ip', '')             # 目标IP地址
+                ])
+        
+        print(f"链路质量数据已保存到: {csv_filename}")
+    
+    def save_all_nodes_data_csv(self):
+        """保存所有节点的链路质量数据到CSV文件"""
+        import csv
+        from datetime import datetime
+        
+        # 确保test目录存在
+        subprocess.run(["mkdir", "-p", "test"])
+        
+        # 生成时间戳
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 主数据文件（包含所有节点间的链路数据）
+        main_csv_filename = f"test/all_nodes_link_quality_data_{timestamp}.csv"
+        
+        with open(main_csv_filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头
+            writer.writerow([
+                'record_id',           # 记录ID
+                'timestamp',           # 数据生成时间戳
+                'measurement_time',    # 测量时间
+                'src_node',           # 源节点
+                'src_mac',           # 源MAC地址
+                'src_ip',            # 源IP地址
+                'target_node',        # 目标节点
+                'target_mac',         # 目标MAC地址
+                'target_ip',          # 目标IP地址
+                'rssi_dbm',           # RSSI信号强度
+                'bitrate_mbps',       # 比特率
+                'loss_percent',       # 丢包率
+                'latency_ms'          # 延迟
+            ])
+            
+            record_id = 1
+            # 遍历所有节点对
+            for src_node in self.nodes:
+                for record in src_node.link_quality_history:
+                    target_node_name = record.get('target', '')
+                    if target_node_name and target_node_name in self.node_dict:
+                        target_node = self.node_dict[target_node_name]
+                        writer.writerow([
+                            record_id,                       # 记录ID
+                            timestamp,                       # 数据生成时间戳
+                            record.get('time', ''),          # 测量时间
+                            src_node.name,                   # 源节点
+                            src_node.mac,                   # 源MAC地址
+                            src_node.ip,                    # 源IP地址
+                            target_node_name,                # 目标节点
+                            record.get('mac', ''),           # 目标MAC地址
+                            record.get('ip', ''),            # 目标IP地址
+                            record.get('rssi', ''),         # RSSI信号强度
+                            record.get('bitrate', ''),       # 比特率
+                            record.get('loss', ''),          # 丢包率
+                            record.get('latency', '')        # 延迟
+                        ])
+                        record_id += 1
+        
+        print(f"所有节点链路质量数据已保存到: {main_csv_filename}")
+        
+        # 同时为每个节点单独保存一个文件（便于单独分析）
+        for src_node in self.nodes:
+            node_csv_filename = f"test/node_{src_node.name}_link_quality_data_{timestamp}.csv"
+            with open(node_csv_filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'record_id', 'timestamp', 'measurement_time', 'src_node',
+                    'target_node', 'rssi_dbm', 'bitrate_mbps', 'loss_percent', 'latency_ms'
+                ])
+                
+                node_record_id = 1
+                for record in src_node.link_quality_history:
+                    target_node_name = record.get('target', '')
+                    if target_node_name and target_node_name in self.node_dict:
+                        writer.writerow([
+                            node_record_id,                   # 记录ID
+                            timestamp,                       # 数据生成时间戳
+                            record.get('time', ''),          # 测量时间
+                            src_node.name,                   # 源节点
+                            target_node_name,                # 目标节点
+                            record.get('rssi', ''),         # RSSI信号强度
+                            record.get('bitrate', ''),       # 比特率
+                            record.get('loss', ''),          # 丢包率
+                            record.get('latency', '')        # 延迟
+                        ])
+                        node_record_id += 1
+            
+            if node_record_id > 1:  # 如果有数据才打印
+                print(f"节点 {src_node.name} 数据已保存到: {node_csv_filename}")
+
+    def plot_all_nodes(self,save_path=None):
         n=len(self.nodes)
         for i in range(n):
             for j in range(i+1,n):
                 src= self.nodes[i]
                 target= self.nodes[j]
-                self.plot_node_link_quality(src.name, target.name)
+                self.plot_node_link_quality(src.name, target.name,save_path=save_path)
             
     def plot_reward_history(self, save_path="test/reward_history.png"):
         plt.figure(figsize=(15, 8))

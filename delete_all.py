@@ -2,7 +2,7 @@
 import os, glob
 
 root = "test"
-exts = ("*.png","*.jpg","*.jpeg","*.gif")
+exts = ("*.png","*.jpg","*.jpeg","*.gif","*.csv")
 count = 0
 for e in exts:
     for p in glob.glob(os.path.join(root, "**", e), recursive=True):

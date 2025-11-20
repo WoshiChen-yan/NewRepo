@@ -1,0 +1,43 @@
+---
+config:
+  layout: fixed
+  look: classic
+  theme: default
+---
+flowchart LR
+ subgraph subGraph0["1. 初始化阶段"]
+        B{"构建容器化仿真平台"}
+        A["系统启动与初始化"]
+        C{"初始化网络拓扑与节点"}
+        D{"创建 PPO 智能体 (独立Actor + 共享Critic)"}
+        F["开始算法"]
+  end
+ subgraph subGraph1["2. 算法主循环 (每时间步)"]
+        G{"节点移动 (模拟动态拓扑)"}
+        H{"全网状态测量 更新状态历史序列"}
+        J{"核心节点动态选举"}
+        K["独立Actor: 智能决策"]
+        O["执行: 下发路由"]
+        P{"测量奖励 (端到端延迟/丢包)"}
+        Q["学习: 存储经验并更新网络"]
+        V{"达到最大训练步数?"}
+        W["结束仿真与训练"]
+  end
+ subgraph subGraph2["3. 评估阶段"]
+        X["性能评估与结果可视化"]
+  end
+    A --> B
+    B --> C
+    C --> D
+    D --> F
+    F --> G
+    G --> H
+    H --> J
+    J --> K
+    K --> O
+    O --> P
+    P --> Q
+    Q --> V
+    V -- 否 --> F
+    V -- 是 --> W
+    W --> X
