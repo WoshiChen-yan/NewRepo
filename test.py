@@ -12,10 +12,10 @@ Net_1 = Net(name='Net_1', interval=1)
 Net_1.add_node(name="11", mac="02:00:00:00:01:00", ip="10.10.10.1/24",position= (180, 0, 0), direction=(-0.1, 0, 0))
 Net_1.add_node(name="12", mac="02:00:00:00:02:00", ip="10.10.10.2/24",position= (-180, 0, 0),direction= (0.1, 0, 0))
 Net_1.add_node(name="13", mac="02:00:00:00:03:00", ip="10.10.10.3/24",position=(0, 100, 0),direction=(0, 0, 0))
-Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(0, -100, 0),(-1, 0, 0))
-# Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 0))
-# Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(100,20,30),(1,1,1))
-# Net_1.add_node("17", "02:00:00:00:00:07","10.10.10.7/24",(100,200,30),(1,1,0))
+Net_1.add_node("14", "02:00:00:00:00:04", "10.10.10.4/24",(0, -100, 0),(-0.1, 0, 0))
+Net_1.add_node("15", "02:00:00:00:00:05","10.10.10.5/24",(50,50,0),(0, 0, 0))
+Net_1.add_node("16", "02:00:00:00:00:06","10.10.10.6/24",(100,20,30),(0.1,0.1,0.1))
+Net_1.add_node("17", "02:00:00:00:00:07","10.10.10.7/24",(100,200,30),(0.1,0.1,0.1))
 # docker stop 11&&docker rm 11&&docker stop 12&&docker rm 12&&docker stop 13&&docker rm 13&&docker stop 14&&docker rm 14
 # docker stop 15&&docker rm 15&&docker stop 16&&docker rm 16&&docker stop 17&&docker rm 17
 
@@ -41,7 +41,7 @@ Net_1.start_network()
 print("=== 智能路由训练与测试开始 ===")
 times={}
 time_all=time.time()
-training_steps = 50
+training_steps = 80
 last_iteration_time=Net_1.interval
 
 # <--- MODIFIED: 4. 主训练/仿真循环 (v6) ---_>
