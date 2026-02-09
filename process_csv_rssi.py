@@ -129,6 +129,7 @@ def save_detailed_results(results, directory_path, rssi_min, rssi_max,save_path=
     保存详细分析结果到文件
     """
     if save_path:
+        os.makedirs(save_path, exist_ok=True)
         output_file = os.path.join(save_path, f"rssi_analysis_{rssi_min}to{rssi_max}.txt")
     else:
         output_file = os.path.join(directory_path, f"rssi_analysis_{rssi_min}to{rssi_max}.txt")
@@ -173,11 +174,11 @@ def save_detailed_results(results, directory_path, rssi_min, rssi_max,save_path=
 
 if __name__ == "__main__":
     # 设置要分析的目录
-    data_directory = "//home/chenyan/demo/test/"
-    save_path = "/home/chenyan/demo/useful_test/data_process"
+    data_directory = "/home/chenyan/demo/useful_test/ref_origin_2025_11_18/test/"
+    save_path = "/home/chenyan/demo/useful_test/data_process/"
     
     # 设置RSSI范围
-    rssi_min = -85
+    rssi_min = -89
     rssi_max = -75
     
     print(f"开始分析RSSI在{rssi_min}到{rssi_max}之间的数据...")
