@@ -37,6 +37,7 @@ class Node(object):
         self.type=type
         self.neighbors={}
         self.link_quality_history = []  # 用于存储链路质量历史记录
+        self.link_quality_cache={} # 用于缓存当前链路质量，避免频繁调用
         self.net_name=net_name
         self.txpower=txpower###对于绝大多数地面基站来说，使用20的发射功率足够  ，相当于100mv的功率
         docker.from_env().containers.run('ubuntu', 
@@ -317,6 +318,15 @@ class Node(object):
                     except (ValueError, IndexError):
                         pass # 解析 bitrate 失败
         # print(f"节点{self.name}的RSSI信息: {results}")
+        
+        # 保存 RSSI 数据到缓存
+        for mac, rssi_info in results.items():
+            self.update_link_quality_cache(
+                mac,
+                rssi=rssi_info.get('rssi'),
+                bitrate=rssi_info.get('bitrate')
+            )
+        
         return results
         
     def get_latency(self, ips):
@@ -381,25 +391,77 @@ class Node(object):
             print(f"[WARN] 节点{self.name} fping 全部 100% 丢包，需检查 ARP/路由/权限")
 
         # print(f"节点{self.name}的fping 信息: {results}")
+        
+        # 保存延迟和丢包数据到缓存
+        for ip, latency_info in results.items():
+            # 从 IP 反查节点 MAC
+            for node in nodes:
+                if node.ip and node.ip.split('/')[0] == ip:
+                    self.update_link_quality_cache(
+                        node.mac,
+                        latency=latency_info.get('latency'),
+                        loss=latency_info.get('loss')
+                    )
+                    break
+        
         return results
         
+    def update_link_quality_cache(self, target_mac, latency=None, loss=None, rssi=None, bitrate=None):
+        """
+        更新特定target_mac的链路质量缓存和历史记录
+        用于在获取链路信息后立即保存到 cache 和 history
+        
+        Args:
+            target_mac (str): 目标节点的MAC地址
+            latency (float): 延迟 (ms)，None表示保留默认值9999.0
+            loss (float): 丢包率 (%)
+            rssi (float): 信号强度 (dBm)
+            bitrate (float): 速率 (Mbps)
+        """
+        # 构建历史记录条目
+        history_entry = {
+            'mac': target_mac,
+            'time': time.time(),
+            'latency': latency if latency is not None else 9999.0,
+            'loss': loss if loss is not None else 100.0,
+            'rssi': rssi if rssi is not None else -100.0,
+            'bitrate': bitrate if bitrate is not None else 0.0
+        }
+        
+        # 追加到历史记录
+        self.link_quality_history.append(history_entry)
+        if len(self.link_quality_history) > 1000:
+            self.link_quality_history = self.link_quality_history[-1000:]
+        
+        # 更新缓存（用于快速查询）
+        self.link_quality_cache[target_mac] = history_entry.copy()
+    
     # <--- MODIFIED: 新增函数，用于构建完整的状态向量 ---_>
     def get_link_quality_by_mac(self, target_mac):
         """
         获取到特定MAC的完整链路质量，用于状态向量。
         """
-        target_node = get_node_by_mac(target_mac)
-        if not target_node:
-            return None
-
-        # 1. 从历史记录中查找最新的 延迟/丢包/RSSI
+        
+        
+        # 1. 从缓存读取（最快）
+        if target_mac in self.link_quality_cache:
+                cached_link = self.link_quality_cache[target_mac]
+                # 如果缓存数据不超过5秒，直接返回
+                if time.time() - cached_link.get('time', 0) < 5.0:
+                    return cached_link
+                
+                
+        # 2. 从历史记录中查找最新的 延迟/丢包/RSSI
         latest_record = None
         for record in reversed(self.link_quality_history):
             if record.get('mac') == target_mac:
                 latest_record = record
                 break
         
-        # 2. 实时计算物理信息
+        # 3. 实时计算物理信息
+        target_node = get_node_by_mac(target_mac)
+        if not target_node:
+            return None
         distance = self.get_distance(target_node)
         doppler_shift, signal_impact = self.calculate_siganal_impact(target_node)
         
