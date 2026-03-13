@@ -38,6 +38,7 @@ class Node(object):
         self.neighbors={}
         self.link_quality_history = []  # 用于存储链路质量历史记录
         self.link_quality_cache={} # 用于缓存当前链路质量，避免频繁调用
+        self.tx_bytes_snapshot = {}  # {mac: (tx_bytes, timestamp)} 用于计算实时吞吐量
         self.net_name=net_name
         self.txpower=txpower###对于绝大多数地面基站来说，使用20的发射功率足够  ，相当于100mv的功率
         docker.from_env().containers.run('ubuntu', 
@@ -317,14 +318,33 @@ class Node(object):
                         results[current_mac]['bitrate'] = bitrate
                     except (ValueError, IndexError):
                         pass # 解析 bitrate 失败
+
+                # 解析 tx bytes 用于链路吞吐量计算
+                if "tx bytes" in line:
+                    try:
+                        results[current_mac]['tx_bytes'] = int(line.split()[2])
+                    except (ValueError, IndexError):
+                        pass
         # print(f"节点{self.name}的RSSI信息: {results}")
-        
-        # 保存 RSSI 数据到缓存
+
+        # 保存 RSSI 数据到缓存，并计算实时吞吐量
+        now = time.time()
         for mac, rssi_info in results.items():
+            tx_bytes = rssi_info.get('tx_bytes')
+            throughput = 0.0
+            if tx_bytes is not None:
+                if mac in self.tx_bytes_snapshot:
+                    prev_bytes, prev_time = self.tx_bytes_snapshot[mac]
+                    dt = now - prev_time
+                    if dt > 0 and tx_bytes >= prev_bytes:
+                        throughput = (tx_bytes - prev_bytes) / dt / 1e6  # Mbps
+                self.tx_bytes_snapshot[mac] = (tx_bytes, now)
+                
             self.update_link_quality_cache(
                 mac,
                 rssi=rssi_info.get('rssi'),
-                bitrate=rssi_info.get('bitrate')
+                bitrate=rssi_info.get('bitrate'),
+                throughput=throughput
             )
         
         return results
@@ -406,7 +426,7 @@ class Node(object):
         
         return results
         
-    def update_link_quality_cache(self, target_mac, latency=None, loss=None, rssi=None, bitrate=None):
+    def update_link_quality_cache(self, target_mac, latency=None, loss=None, rssi=None, bitrate=None, throughput=None):
         """
         更新特定target_mac的链路质量缓存和历史记录
         用于在获取链路信息后立即保存到 cache 和 history
@@ -417,15 +437,20 @@ class Node(object):
             loss (float): 丢包率 (%)
             rssi (float): 信号强度 (dBm)
             bitrate (float): 速率 (Mbps)
+            throughput (float): 实时吞吐量 (Mbps)，由 tx bytes delta 计算
         """
         # 构建历史记录条目
+        _bitrate = bitrate if bitrate is not None else 0.0
+        _throughput = throughput if throughput is not None else 0.0
         history_entry = {
             'mac': target_mac,
             'time': time.time(),
             'latency': latency if latency is not None else 9999.0,
             'loss': loss if loss is not None else 100.0,
             'rssi': rssi if rssi is not None else -100.0,
-            'bitrate': bitrate if bitrate is not None else 0.0
+            'bitrate': _bitrate,
+            'throughput': _throughput,
+            'utilization': min(_throughput / max(_bitrate, 1.0), 1.0)  # 链路利用率 [0,1]
         }
         
         # 追加到历史记录
@@ -448,7 +473,15 @@ class Node(object):
                 cached_link = self.link_quality_cache[target_mac]
                 # 如果缓存数据不超过5秒，直接返回
                 if time.time() - cached_link.get('time', 0) < 5.0:
+                    target_node = get_node_by_mac(target_mac)
+                    if target_node:
+                        distance = self.get_distance(target_node)
+                        doppler_shift, _ = self.calculate_siganal_impact(target_node)
+                        cached_link = dict(cached_link)
+                        cached_link['distance'] = distance
+                        cached_link['doppler_shift'] = doppler_shift
                     return cached_link
+                
                 
                 
         # 2. 从历史记录中查找最新的 延迟/丢包/RSSI
@@ -472,6 +505,8 @@ class Node(object):
                 'loss': latest_record.get('loss', 100.0),
                 'rssi': latest_record.get('rssi', -100.0),
                 'bitrate': latest_record.get('bitrate', 0.0),
+                'throughput': latest_record.get('throughput', 0.0),
+                'utilization': latest_record.get('utilization', 0.0),
                 'doppler_shift': doppler_shift
             }
         else:
@@ -482,6 +517,8 @@ class Node(object):
                 'loss': 100.0,
                 'rssi': -100.0,
                 'bitrate': 0.0,
+                'throughput': 0.0,
+                'utilization': 0.0,
                 'doppler_shift': doppler_shift
             }
 

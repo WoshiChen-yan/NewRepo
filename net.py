@@ -9,7 +9,7 @@ import time
 import subprocess
 from module import Mac80211Hwsim
 from wmediumdConnector import w_server
-from ppoagent import PPOAgent , PPOCritic # <--- MODIFIED: 导入 PPOAgent 和 PPOCritic
+from ppoagent import PPOAgent, PPOCritic, SPLIT_WEIGHTS  # SPLIT_WEIGHTS: ip route nexthop weight 整数对
 import matplotlib.pyplot as plt
 import threading
 import torch
@@ -172,7 +172,7 @@ class Net:
         self.num_dests= total_nodes
         self.num_next_hops= total_nodes
         self.MAX_NEIGHBORS = total_nodes - 1
-        self.state_dim = self.MAX_NEIGHBORS * 5
+        self.state_dim = self.MAX_NEIGHBORS * 6  # 6 features: distance,latency,loss,rssi,doppler,throughput
         
         
         
@@ -223,12 +223,13 @@ class Net:
                 link_info['latency']/100.0,
                 link_info['loss']/100.0,
                 link_info['rssi']/100.0,
-                link_info['doppler_shift']/1000.0
+                link_info['doppler_shift']/1000.0,
+                link_info.get('utilization', 0.0)  # 链路利用率 [0,1] = throughput/bitrate
             ])
             neighbor_map_indices.append(self.nodes.index(target_node))
 
-        # 5. 填充状态向量
-        padding_len = (self.MAX_NEIGHBORS * 5) - len(state_vector)
+        # 5. 填充状态向量 (6 features per neighbor)
+        padding_len = (self.MAX_NEIGHBORS * 6) - len(state_vector)
         if padding_len > 0:
             state_vector.extend([0.0] * padding_len)
             
@@ -255,11 +256,14 @@ class Net:
         
         latency = min(link_info.get('latency', 1000.0), 1000.0) 
         loss = min(link_info.get('loss', 100.0), 100.0)
-        
+        throughput = min(link_info.get('throughput', 0.0), 100.0)  # Mbps, cap at 100
+
         lat_penalty = (latency / 100.0) * 5.0
         loss_penalty = (loss / 100.0) * 5.0
-        
-        reward = 10.0 - lat_penalty - loss_penalty
+        # 吞吐量奖励: 链路实际被使用时给正向激励 (最大 +2.0)
+        throughput_bonus = min(throughput / 50.0, 2.0)
+
+        reward = 10.0 - lat_penalty - loss_penalty + throughput_bonus
         
         if latency >= 9999.0 or (loss == 100.0 and latency > 1000):
             return -5.0
@@ -319,25 +323,26 @@ class Net:
         all_actions_to_execute = {} # 仅用于核心节点
         all_transitions = {}      # 用于所有节点 (S, A, logP)
         
-        # --- 步骤 1: 决策 (所有节点都"思考", 保证边缘节点也能存储经验) ---
-        for node in self.nodes: 
+        # --- 步骤 1: 决策 (仅核心节点参与，降低计算开销) ---
+        for node in self.core_nodes: 
             agent = self.all_node_agents.get(node.name)
             if not agent: continue 
             
             node_index = self.nodes.index(node)
             state_seq, neighbor_map_indices = self.get_state_sequence(node.name)
-            actions, old_logprobs = agent.select_action(state_seq, node_index, neighbor_map_indices)
-            
-            all_transitions[node.name] = (state_seq, actions, old_logprobs)
+            actions, split_actions, old_logprobs, old_split_logprobs = agent.select_action(
+                state_seq, node_index, neighbor_map_indices)
+
+            all_transitions[node.name] = (state_seq, actions, split_actions, old_logprobs, old_split_logprobs)
 
             # (关键) 只存储 *核心节点* 的动作, 用于执行
             if node in self.core_nodes:
-                all_actions_to_execute[node.name] = actions
+                all_actions_to_execute[node.name] = (actions, split_actions)
             
         # --- 步骤 2: 执行 (核心节点PPO, 边缘节点默认) ---
-        for node_name, node_actions in all_actions_to_execute.items():
+        for node_name, (node_actions, node_split_actions) in all_actions_to_execute.items():
             core_node = self.node_dict[node_name]
-            self.apply_node_routing(core_node, node_actions) 
+            self.apply_node_routing(core_node, node_actions, node_split_actions)
 
         for edge_node in self.edge_nodes:
             self.apply_default_routing(edge_node)
@@ -348,16 +353,16 @@ class Net:
         self.test_all_links_concurrent()
         
         
-        # --- 步骤 4: 收集经验 (所有节点) ---
+        # --- 步骤 4: 收集经验 (仅核心节点) ---
         self.global_steps += 1
         current_step_core_rewards = [] # 用于健康检查
         
-        for node in self.nodes:
+        for node in self.core_nodes:
             agent = self.all_node_agents.get(node.name)
             if not agent or node.name not in all_transitions:
                 continue
 
-            (state_seq, actions, old_logprobs) = all_transitions[node.name]
+            (state_seq, actions, split_actions, old_logprobs, old_split_logprobs) = all_transitions[node.name]
             new_state_seq, _ = self.get_state_sequence(node.name)
             done = False 
 
@@ -377,7 +382,7 @@ class Net:
                 self.reward_history[node.name][dest_node.name].append(reward)
 
             # (关键) 所有节点都 *存储* 经验, 保证数据是最新的
-            agent.store((state_seq, actions, rewards_list, new_state_seq, old_logprobs, done))
+            agent.store((state_seq, actions, split_actions, rewards_list, new_state_seq, old_logprobs, old_split_logprobs, done))
             
             if node in self.core_nodes and rewards_list:
                 current_step_core_rewards.append(np.mean(rewards_list))
@@ -414,7 +419,7 @@ class Net:
             if self.bad_network_health_counter >= self.reelection_patience:
                 print(f"  [!!! 事件触发] 网络健康度连续 {self.reelection_patience} 次不佳, 触发核心节点重选举!")
                 self.test_all_links_concurrent() 
-                self.select_core_nodes_distributed(num_nodes_rate=0.3)
+                self.select_core_nodes(num_nodes_rate=0.3)
                 # (选举函数在内部会重置计数器)
     
     # --- (v5) 边缘路由逻辑 ---
@@ -478,303 +483,104 @@ class Net:
             print(f"[WARN] Edge node {edge_node.name} has no neighbors. Default route removed.")
 
     # --- (v5) 核心路由应用 ---
-    def apply_node_routing(self, core_node, actions_matrix):
+        # --- (v5) 核心路由应用 ---
+    def apply_node_routing(self, core_node, actions_matrix, split_ratios_matrix=None):
         """
-        应用核心节点的路由决策
+        应用核心节点的路由决策。
+        split_ratios_matrix: list[int], 分流档位索引 (0=100/0, 1=75/25, 2=50/50, 3=25/75, 4=0/100)
         """
-        
-        core_node.cmd("ip route flush all proto 188") 
-        
+        core_node.cmd("ip route flush all proto 188")
+
         for dest_index, actions in enumerate(actions_matrix):
             dest_node = self.nodes[dest_index]
-            if dest_node == core_node: continue
-                
+            if dest_node == core_node:
+                continue
+
             primary_hop_index = actions[0]
             backup_hop_index = actions[1]
-            
+
             if primary_hop_index >= len(self.nodes) or backup_hop_index >= len(self.nodes):
                 continue
 
             primary_hop_node = self.nodes[primary_hop_index]
             backup_hop_node = self.nodes[backup_hop_index]
-            
+
             dest_ip = dest_node.ip.split('/')[0]
             primary_hop_ip = primary_hop_node.ip.split('/')[0]
             backup_hop_ip = backup_hop_node.ip.split('/')[0]
-            
             core_ip = core_node.ip.split('/')[0]
-            core_iface = core_node.name # 获取 wlan 接口名
+            core_iface = core_node.name
 
-            # 1. 检查无效动作: 下一跳是自己
-            # (注意: ppoagent 里的掩码 应该已经阻止了_index，
-            #  但我们在这里检查 IP 作为双重保险)
+            # 1. 无效动作: 下一跳是自己
             if primary_hop_ip == core_ip:
-                continue # 非法动作，不安装路由 (agent 会得到坏奖励)
+                continue
 
-            # 2. 检查有效动作: 下一跳是目的地 (直连路由)
+            # 2. 直连路由: 下一跳即目的地, 无需分流
             elif primary_hop_ip == dest_ip:
-                # 这是最优的 1 跳直连路由
-                # 我们必须安装一个 'dev' 路由，而不是 'via' 路由
-                cmd_direct = f"ip route replace {dest_ip} dev wlan{core_iface} metric 10 proto 188"
-                core_node.cmd(cmd_direct)
-                
-            # 3. 检查有效动作: 下一跳是网关 (2跳路由)
+                cmd = f"ip route replace {dest_ip} dev wlan{core_iface} metric 10 proto 188"
+                core_node.cmd(cmd)
+
+            # 3. 网关路由: 根据 split_ratios_matrix 决定是否 ECMP 分流
             else:
-                # 这是标准的 2 跳路由
-                cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
-                core_node.cmd(cmd_primary)
+                split_level = split_ratios_matrix[dest_index] if split_ratios_matrix else 0
+                w_primary, w_backup = SPLIT_WEIGHTS[split_level]
 
-                # 4. (可选) 安装备用路由
-                # 确保备用路由也不是自己或目的地
-                if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_ip and backup_hop_ip != dest_ip:
-                    cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
-                    core_node.cmd(cmd_backup)
+                can_split = (
+                    w_primary > 0 and w_backup > 0
+                    and primary_hop_ip != backup_hop_ip
+                    and backup_hop_ip != core_ip
+                    and backup_hop_ip != dest_ip
+                )
 
-            # if primary_hop_ip == core_node.ip.split('/')[0] or primary_hop_ip == dest_ip:
-            #     continue 
-
-            # cmd_primary = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
-            # core_node.cmd(cmd_primary)
-            
-            # if primary_hop_ip != backup_hop_ip and backup_hop_ip != core_node.ip.split('/')[0] and backup_hop_ip != dest_ip:
-            #     cmd_backup = f"ip route add {dest_ip} via {backup_hop_ip} metric 20 proto 188"
-            #     core_node.cmd(cmd_backup)
-
-    def end_test(self):
-        self.cleanup_interfaces()
-        # 停止所有节点上的 iperf
-        for node in self.nodes:
-            node.cmd("pkill iperf")
-        
-        for node in self.nodes:
-            node.remove_node()
-        print(f"网络'{self.name}'已经结束测试")
-        self.reset_node_ids()
-        
-        
-    def stop_rm_specific(self,name):
-        for node in self.nodes:
-            if node.name==name:
-                node.remove_node()
-        
-    def generate_nodes(self, num_nodes, pattern="random", base_position=(0,0,0), spacing=3):
-        """
-        Automatically generate and add nodes to the network with different position patterns
-        Args:
-            num_nodes: Number of nodes to generate
-            pattern: Position pattern ("grid", "circle", "random", "line")
-            base_position: Starting position (x,y,z)
-            spacing: Space between nodes
-        """
-        for i in range(num_nodes):
-            # Generate basic node properties
-            name = f"{i+11}"  # Names start from 11
-            mac = f"02:00:00:00:{i+1:02d}:00"  # MAC addresses
-            ip = f"10.10.10.{i+1}/24"  # IP addresses
-            
-            # Calculate position based on pattern
-            if pattern == "grid":
-                x = base_position[0] + (i % 3) * spacing
-                y = base_position[1] + (i // 3) * spacing
-                z = base_position[2] +  i
-                position = (x, y, z)
-                # Direction pointing to center
-                center = (x + spacing/2, y + spacing/2, z)
-                direction = self._calculate_direction(position, center)
-                
-            elif pattern == "circle":
-                angle = (2 * np.pi * i) / num_nodes
-                x = base_position[0] + spacing * np.cos(angle)
-                y = base_position[1] + spacing * np.sin(angle)
-                z = base_position[2] +  i
-                position = (x, y, z)
-                # Direction pointing to circle center
-                direction = self._calculate_direction(position, base_position)
-                
-            elif pattern == "line":
-                x = base_position[0] + i * spacing
-                y = base_position[1] + i * spacing
-                z = base_position[2] +  i
-                position = (x, y, z)
-                # Direction along the line
-                direction = (1, 0, 0)
-                
-            elif pattern == "random":
-                x = base_position[0] + np.random.uniform(-spacing, spacing)
-                y = base_position[1] + np.random.uniform(-spacing, spacing)
-                z = base_position[2] + np.random.uniform(-spacing, spacing)
-                position = (x, y, z)
-                # Random direction
-                direction = self._normalize_vector(np.random.uniform(-1, 1, 3))
-            
-            # Add node to network
-            self.add_node(name, mac, ip, position, direction)
-            print(f"Added node {name} at position {position} with direction {direction}")
-
-    def _calculate_direction(self, from_pos, to_pos):
-        """Calculate normalized direction vector from one position to another"""
-        direction = np.array(to_pos) - np.array(from_pos)
-        return tuple(self._normalize_vector(direction))
-
-    def _normalize_vector(self, vector):
-        """Normalize a vector to unit length"""
-        norm = np.linalg.norm(vector)
-        if norm == 0:
-            return tuple(np.zeros_like(vector))
-        return tuple(vector / norm)
-    
-            
-
-    def wmediumd_config(self, path='test.cfg'):
-        """
-        生成 wmediumd 配置文件（test.cfg），格式与示例一致。
-        使用 self.nodes 中的 mac, position, direction, txpower 字段。
-        """
-        # prepare lists
-        ids = [f'"{n.mac}"' for n in self.nodes]
-        positions = [f"({n.position[0]:.1f}, {n.position[1]:.1f}, {n.position[2]:.1f})" for n in self.nodes]
-        # directions 精确到小数点后一位，确保三元组存在
-        directions = []
-        for n in self.nodes:
-            d = n.direction
-            if isinstance(d, (list, tuple)):
-                if len(d) >= 3:
-                    directions.append(f"({d[0]:.1f}, {d[1]:.1f})")
-                elif len(d) == 2:
-                    directions.append(f"({d[0]:.1f}, {d[1]:.1f}, 0.0)")
+                if can_split:
+                    # ECMP 加权分流
+                    cmd = (
+                        f"ip route replace {dest_ip} proto 188 "
+                        f"nexthop via {primary_hop_ip} weight {w_primary} "
+                        f"nexthop via {backup_hop_ip} weight {w_backup}"
+                    )
+                elif w_primary > 0:
+                    cmd = f"ip route replace {dest_ip} via {primary_hop_ip} metric 10 proto 188"
                 else:
-                    directions.append("(0.0, 0.0, 0.0)")
-            else:
-                directions.append("(0.0, 0.0, 0.0)")
-        txpowers = [f"{getattr(n, 'txpower', 30.0):.1f}" for n in self.nodes]
+                    cmd = f"ip route replace {dest_ip} via {backup_hop_ip} metric 10 proto 188"
+                core_node.cmd(cmd)
 
-        content = []
-        content.append("ifaces :")
-        content.append("{")
-        content.append(f"    count={len(ids)};")
-        content.append("    ids = [")
-        content.append("    " + ",\n    ".join(ids))
-        content.append("    ];")
-        content.append("}")
-        content.append("        ")
-        content.append("model :")
-        content.append("{")
-        content.append('    type = "path_loss";')
-        content.append("    positions = (")
-        content.append("        " + ",\n        ".join(positions))
-        content.append("    );")
-        content.append("    directions = (")
-        content.append("        " + ",\n        ".join(directions))
-        content.append("    );")
-        content.append("    tx_powers = (" + ", ".join(txpowers) + ");")
-        content.append('    model_name = "log_distance";')
-        content.append("    path_loss_exp = 3.5;")
-        content.append("    xg = 0.0;")
-        content.append("};")
 
-        cfg_text = "\n".join(content) + "\n"
-
-        try:
-            with open(path, "w") as f:
-                f.write(cfg_text)
-            print(f"wmediumd 配置已写入: {path}")
-        except Exception as e:
-            print(f"[ERROR] 写入 wmediumd 配置失败: {e}")
-
-    
-    def select_core_nodes_distributed(self, num_nodes_rate=0.3):
-        """
-        (v0.2.0)
-        根据局部邻居质量选择核心节点。
-        (关键) 此函数不再创建或销毁智能体, 仅更新 self.core_nodes 和 self.edge_nodes 列表。
-        """
-        print(f"\n--- [核心节点重选举 步骤 {self.global_steps}] ---")
-        
-        node_scores = {}
-        
-        # 1. 计算每个节点的“局部中心性”得分 (使用您上次的多指标评分)
-        for node in self.nodes:
-            score = 0.0 # 使用浮点数
-            try:
-                for target_node in self.nodes:
-                    if target_node == node: continue
-                    link_info = node.get_link_quality_by_mac(target_node.mac)
-                    if not link_info: continue
-
-                    # --- 多指标评分逻辑 ---
-                    rssi = link_info.get('rssi', -100.0)
-                    loss = link_info.get('loss', 100.0)
-                    latency = link_info.get('latency', 9999.0)
-                    link_score = 0.0
-                    
-                    RSSI_THRESHOLD_BASE = -85.0
-                    if rssi > RSSI_THRESHOLD_BASE:
-                        # 基础分: RSSI 越高分越高
-                        link_score = (rssi - RSSI_THRESHOLD_BASE) # e.g., -70dBm -> 15 分
-                    
-                    RSSI_THRESHOLD_GOOD = -65.0
-                    if rssi > RSSI_THRESHOLD_GOOD:
-                        # 奖励分: 信号好时, 额外奖励低丢包和低延迟
-                        loss_bonus = (100.0 - loss) / 10.0 # 0% loss = +10 分
-                        lat_bonus = 0.0
-                        if latency < 50.0: lat_bonus = 10.0
-                        elif latency < 200.0: lat_bonus = 5.0
-                        link_score += (loss_bonus + lat_bonus)
-                    # --- 评分逻辑结束 ---
-                    
-                    score += link_score
-                    
-            except Exception as e:
-                print(f"  获取 {node.name} 邻居失败: {e}")
-                score = 0
-            
-            node_scores[node.name] = score 
-        
-        # 2. 选择 Top N% 节点
-        num_core = max(1, int(len(self.nodes) * num_nodes_rate))
-        sorted_nodes = sorted(node_scores.items(), key=lambda item: item[1], reverse=True)
-        
-        new_core_node_names = {name for name, score in sorted_nodes[:num_core]}
-        new_edge_node_names = {name for name, score in sorted_nodes[num_core:]}
-
-        # 3. (关键) 更新动态列表 (不再创建/删除智能体)
-        self.core_nodes = [self.node_dict[name] for name in new_core_node_names]
-        self.edge_nodes = [self.node_dict[name] for name in new_edge_node_names]
-         
-        # 4. 重置健康检查计数器 (因为刚选举完)
-        self.bad_network_health_counter = 0
-        
-        print(f"  局部得分排名: {[(n, f'{s:.2f}') for n, s in sorted_nodes]}")
-        print(f"  (v0.2.0) 重选举完成: ")
-        print(f"  新核心节点 (Top {num_core}): {[n.name for n in self.core_nodes]}")
-        print(f"  新边缘节点: {[n.name for n in self.edge_nodes]}")
-                    
     # 取消注释 select_core_nodes 并实现 PPOAgent 的创建 ---_>
     def select_core_nodes(self, num_nodes_rate=0.3):
         """
         选择核心节点，并初始化共享的 Critic 和所有 PPO 智能体
         """
-        print("\n=== 初始化核心节点和 PPO 智能体 ===")
+        # print("\n=== 初始化核心节点和 PPO 智能体 ===")
         
-        # 1. 选择核心节点 (使用您原来的邻居/RSSI逻辑)
+        # 1. 选择核心节点 (按局部连通性 + 平均RSSI评分)
         node_scores = {}
         for node in self.nodes:
-            # (确保节点在选择前已经有邻居信息)
-            # (为简单起见，我们假设所有节点都是核心节点)
-            # neighbors = node.get_neighbor() 
-            # ... (您原来的打分逻辑) ...
-            node_scores[node.name] = 1 # 简化：所有节点得分相同
-            
+            reachable = 0
+            rssi_sum = 0.0
+            for other in self.nodes:
+                if other == node:
+                    continue
+                link_info = node.get_link_quality_by_mac(other.mac)
+                if not link_info:
+                    continue
+                rssi = link_info.get('rssi', -100.0)
+                loss = link_info.get('loss', 100.0)
+                if rssi > -100 and loss < 100:
+                    reachable += 1
+                    rssi_sum += rssi
+
+            avg_rssi = (rssi_sum / reachable) if reachable > 0 else -100.0
+            # 连通邻居数量权重更高，RSSI作为细粒度打分
+            node_scores[node.name] = reachable * 10.0 + (avg_rssi + 100.0)
+
         num_core = max(1, int(len(self.nodes) * num_nodes_rate))
-        # <--- MODIFIED: 简化 - 选择所有节点作为核心节点进行训练 ---_>
-        num_core = len(self.nodes) 
-        
+
         core_nodes_sorted = sorted(node_scores.items(), key=lambda x: x[1], reverse=True)[:num_core]
-        
-        self.core_nodes = [
-            node for node in self.nodes
-            if node.name in [name for name, _ in core_nodes_sorted]
-        ]
+
+        core_name_set = {name for name, _ in core_nodes_sorted}
+        self.core_nodes = [node for node in self.nodes if node.name in core_name_set]
+        self.edge_nodes = [node for node in self.nodes if node.name not in core_name_set]
         
         # <--- MODIFIED: 创建一个 节点名 -> 节点对象 的映射，方便查找 ---_>
         self.node_dict = {node.name: node for node in self.nodes}
@@ -783,7 +589,7 @@ class Net:
 
         # 2. 定义状态和动作空间的维度
         # 状态维度 = (节点数 - 1) * 5 (distance, latency, loss, rssi, doppler)
-        self.state_dim = (len(self.nodes) - 1) * 5 
+        self.state_dim = (len(self.nodes) - 1) * 6  # 6 features per neighbor
         # (如果添加了队列状态，这里需要增加维度)
         
         # 动作空间
@@ -798,24 +604,26 @@ class Net:
 
         # 3. 创建 *共享的* Critic 和其优化器
         print("创建共享 Critic...")
-        self.global_critic = PPOCritic(self.state_dim, self.gru_hidden_dim)
+        self.global_critic = PPOCritic(self.state_dim, self.num_dests, self.gru_hidden_dim, self.dest_embedding_dim)
         self.global_critic_optimizer = torch.optim.Adam(self.global_critic.parameters(), lr=1e-3)
 
         # 4. 为每个核心节点创建 PPOAgent (独立 Actor)
         for core_node in self.core_nodes:
             name = core_node.name
-            if name not in self.node_agents:
+            if name not in self.all_node_agents:
                 agent = PPOAgent(
                     state_dim=self.state_dim,
                     num_dests=self.num_dests,
                     num_next_hops=self.num_next_hops,
                     gru_hidden_dim=self.gru_hidden_dim,
+                    dest_embedding_dim=self.dest_embedding_dim,
                     actor_lr=1e-4,
                     critic_lr=1e-3,
-                    critic=self.global_critic, # <--- 传入共享 Critic
-                    critic_optimizer=self.global_critic_optimizer # <--- 传入共享优化器
+                    critic=self.global_critic,
+                    critic_optimizer=self.global_critic_optimizer
                 )
-                self.node_agents[name] = agent
+                self.all_node_agents[name] = agent
+                self.reward_history[name] = {} # 初始化奖励历史
                 print(f"已为节点 {name} 创建 PPOAgent (Actor)")
          
                     
@@ -975,7 +783,7 @@ class Net:
             return
             
         for record in src_node.link_quality_history:
-            if record['target'] == target_node_name:
+            if record.get('target') == target_node_name:
                 times.append(record['time'])
                 rssis.append(record['rssi'])
                 bitrates.append(record['bitrate'])
@@ -1196,3 +1004,96 @@ class Net:
                     rssi=final_entry.get('rssi'),
                     bitrate=final_entry.get('bitrate')
                 )
+
+    def wmediumd_config(self, path='test.cfg'):
+        """
+        根据 self.nodes 中的节点信息生成 wmediumd 配置文件（默认 test.cfg）。
+        读取每个节点的 mac, position, direction, txpower 字段。
+        """
+        ids = [f'\"{n.mac}\"' for n in self.nodes]
+
+        positions = [
+            f"({n.position[0]:.1f}, {n.position[1]:.1f}, {n.position[2]:.1f})"
+            for n in self.nodes
+        ]
+
+        directions = []
+        for n in self.nodes:
+            d = n.direction
+            if isinstance(d, (list, tuple)) and len(d) >= 3:
+                directions.append(f"({d[0]:.1f}, {d[1]:.1f})")
+            elif isinstance(d, (list, tuple)) and len(d) == 2:
+                directions.append(f"({d[0]:.1f}, {d[1]:.1f})")
+            else:
+                directions.append("(0.0, 0.0)")
+
+        txpowers = [f"{getattr(n, 'txpower', 30.0):.1f}" for n in self.nodes]
+
+        lines = []
+        lines.append("ifaces :")
+        lines.append("{")
+        lines.append(f"    count = {len(ids)};")
+        lines.append("    ids = [")
+        for i, mid in enumerate(ids):
+            sep = "," if i < len(ids) - 1 else ""
+            lines.append(f"        {mid}{sep}")
+        lines.append("    ];")
+        lines.append("};")
+        lines.append("")
+        lines.append("model :")
+        lines.append("{")
+        lines.append('    type = "path_loss";')
+        lines.append("    positions = (")
+        for i, pos in enumerate(positions):
+            sep = "," if i < len(positions) - 1 else ""
+            lines.append(f"        {pos}{sep}")
+        lines.append("    );")
+        lines.append("    directions = (")
+        for i, d in enumerate(directions):
+            sep = "," if i < len(directions) - 1 else ""
+            lines.append(f"        {d}{sep}")
+        lines.append("    );")
+        lines.append("    tx_powers = (" + ", ".join(txpowers) + ");")
+        lines.append('    model_name = "log_distance";')
+        lines.append("    path_loss_exp = 3.5;")
+        lines.append("    xg = 0.0;")
+        lines.append("};")
+
+        cfg_text = "\n".join(lines) + "\n"
+
+        try:
+            with open(path, "w") as f:
+                f.write(cfg_text)
+            print(f"wmediumd 配置已写入: {path}")
+        except Exception as e:
+            print(f"[ERROR] 写入 wmediumd 配置失败: {e}")
+
+    def end_test(self):
+        """
+        清理测试环境：停止 wmediumd、删除所有 Docker 容器、卸载 mac80211_hwsim 模块。
+        """
+        print("\n=== 清理测试环境 ===")
+
+        # 1. 停止 wmediumd
+        try:
+            subprocess.run(["sudo", "pkill", "-f", "wmediumd"], check=False)
+            print("  wmediumd 已停止。")
+        except Exception as e:
+            print(f"  停止 wmediumd 失败: {e}")
+
+        # 2. 删除所有容器节点
+        for node in self.nodes:
+            try:
+                node.remove_node()
+            except Exception as e:
+                print(f"  删除节点 {node.name} 失败: {e}")
+
+        # 3. 卸载 mac80211_hwsim 内核模块
+        try:
+            subprocess.run(["sudo", "rmmod", "mac80211_hwsim"], check=False,
+                           stderr=subprocess.DEVNULL)
+            print("  mac80211_hwsim 模块已卸载。")
+        except Exception as e:
+            print(f"  卸载 mac80211_hwsim 失败: {e}")
+
+        print("=== 清理完成 ===")

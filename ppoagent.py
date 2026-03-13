@@ -5,31 +5,51 @@ import numpy as np
 from collections import deque
 import random
 
+# 流量分配比例档位: (主路占比, 备路占比)
+SPLIT_RATIOS = [(1.0, 0.0), (0.75, 0.25), (0.5, 0.5), (0.25, 0.75), (0.0, 1.0)]
+# 对应 ip route nexthop weight 整数对
+SPLIT_WEIGHTS = [(1, 0), (3, 1), (1, 1), (1, 3), (0, 1)]
+
+
 # --- MODIFIED (v5): Actor 为所有目的地决策 ---
 class PPOActor(nn.Module):
-    def __init__(self, state_dim, num_dests, num_next_hops, gru_hidden_dim):
+    def __init__(self, state_dim, num_dests, num_next_hops, gru_hidden_dim, num_split_levels=5):
         super().__init__()
         self.num_dests = num_dests
         self.num_next_hops = num_next_hops
         self.gru_hidden_dim = gru_hidden_dim
+        self.num_split_levels = num_split_levels
 
         self.gru = nn.GRU(state_dim, gru_hidden_dim, batch_first=True)
-        
+
+        # 下一跳选择头 (主路 + 备路)
         self.fc = nn.Sequential(
             nn.Linear(gru_hidden_dim, 128),
             nn.ReLU(),
-            # 输出: [所有目的地, 主/备, 所有下一跳]
-            nn.Linear(128, num_dests * 2 * num_next_hops) 
+            nn.Linear(128, num_dests * 2 * num_next_hops)
+        )
+
+        # 分流比例头: 输出 [num_dests, num_split_levels]
+        self.split_fc = nn.Sequential(
+            nn.Linear(gru_hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_dests * num_split_levels)
         )
         
     def forward(self, x):
         # x 形状: [batch_size, seq_len, state_dim]
         gru_out, _ = self.gru(x)
         last_time_step_out = gru_out[:, -1, :]
-        out = self.fc(last_time_step_out)
-        
-        # reshape 为 [batch, num_dests, 2, num_next_hops]
-        return out.view(-1, self.num_dests, 2, self.num_next_hops)
+
+        # 下一跳 logits: [batch, num_dests, 2, num_next_hops]
+        nexthop_logits = self.fc(last_time_step_out).view(
+            -1, self.num_dests, 2, self.num_next_hops)
+
+        # 分流比例 logits: [batch, num_dests, num_split_levels]
+        split_logits = self.split_fc(last_time_step_out).view(
+            -1, self.num_dests, self.num_split_levels)
+
+        return nexthop_logits, split_logits
 
 # --- MODIFIED (v5): Critic 接收 状态 + 目标 ---
 class PPOCritic(nn.Module):
@@ -77,9 +97,10 @@ class PPOCritic(nn.Module):
 class PPOAgent:
     def __init__(self, state_dim, num_dests, num_next_hops, gru_hidden_dim, dest_embedding_dim,
                  actor_lr=1e-4, critic_lr=1e-3, gamma=0.99, eps_clip=0.2,
-                 critic=None, critic_optimizer=None, batch_size=32):
-        
-        self.actor = PPOActor(state_dim, num_dests, num_next_hops, gru_hidden_dim)
+                 critic=None, critic_optimizer=None, batch_size=32, entropy_coeff=0.01,
+                 num_split_levels=5):
+
+        self.actor = PPOActor(state_dim, num_dests, num_next_hops, gru_hidden_dim, num_split_levels)
         self.optimizerA = optim.Adam(self.actor.parameters(), lr=actor_lr)
         
         # --- MODIFIED (v5): 坚持使用共享 Critic ---
@@ -97,7 +118,9 @@ class PPOAgent:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.batch_size = batch_size
-        self.memory = deque() 
+        self.entropy_coeff = entropy_coeff  # 熵正则化系数: 越高越鼓励均匀分配流量 (负载均衡)
+        self.num_split_levels = num_split_levels
+        self.memory = deque()
         self.num_dests = num_dests
         self.num_next_hops = num_next_hops
 
@@ -111,9 +134,10 @@ class PPOAgent:
         """
         state = torch.FloatTensor(state).unsqueeze(0)  # [1, seq_len, state_dim]
         
-        # logits 形状 [1, num_dests, 2, num_next_hops]
-        logits = self.actor(state)
-        
+        # nexthop_logits: [1, num_dests, 2, num_next_hops]
+        # split_logits:   [1, num_dests, num_split_levels]
+        logits, split_logits = self.actor(state)
+
         actions = []
         logprobs = []
         
@@ -160,7 +184,17 @@ class PPOAgent:
             actions.append(dest_actions)      # [num_dests, 2]
             logprobs.append(dest_logprobs)    # [num_dests, 2]
             
-        return actions, logprobs  
+        # ── 分流比例动作采样 ────────────────────────────
+        split_actions = []
+        split_logprobs_out = []
+        for dest_index in range(self.num_dests):
+            s_probs = torch.softmax(split_logits[0, dest_index], dim=-1)
+            s_dist = torch.distributions.Categorical(s_probs)
+            s_action = s_dist.sample()
+            split_actions.append(s_action.item())
+            split_logprobs_out.append(s_dist.log_prob(s_action).item())
+
+        return actions, split_actions, logprobs, split_logprobs_out
 
     def store(self, transition):
         # transition: (state, actions, rewards_list, next_state, old_logprobs, done)
@@ -175,21 +209,25 @@ class PPOAgent:
         # self.memory.clear() 
         
         # rewards_list 是 [batch, num_dests]
-        states, actions, rewards_list, next_states, old_logprobs_list, dones = zip(*batch)
+        states, actions, split_actions_raw, rewards_list, next_states, old_logprobs_list, old_split_logprobs_list, dones = zip(*batch)
 
         states = torch.FloatTensor(np.array(states))
         next_states = torch.FloatTensor(np.array(next_states))
-        actions = torch.LongTensor(actions)               # [batch, num_dests, 2]
-        rewards = torch.FloatTensor(rewards_list)         # [batch, num_dests]
-        old_logprobs = torch.FloatTensor(old_logprobs_list) # [batch, num_dests, 2]
-        dones = torch.FloatTensor(dones).unsqueeze(1)     # [batch, 1]
+        actions = torch.LongTensor(actions)                        # [batch, num_dests, 2]
+        split_actions = torch.LongTensor(list(split_actions_raw))  # [batch, num_dests]
+        rewards = torch.FloatTensor(rewards_list)                  # [batch, num_dests]
+        old_logprobs = torch.FloatTensor(old_logprobs_list)        # [batch, num_dests, 2]
+        old_split_logprobs = torch.FloatTensor(list(old_split_logprobs_list))  # [batch, num_dests]
+        dones = torch.FloatTensor(dones).unsqueeze(1)              # [batch, 1]
 
         current_batch_size = states.shape[0]
         
         actor_loss_total = 0
         critic_loss_total = 0
         
-        logits = self.actor(states) # [batch, num_dests, 2, num_next_hops]
+        logits, split_logits = self.actor(states)
+        # logits:       [batch, num_dests, 2, num_next_hops]
+        # split_logits: [batch, num_dests, num_split_levels]
 
         for dest_index in range(self.num_dests):
             # 准备 Critic 输入
@@ -221,9 +259,22 @@ class PPOAgent:
                 surr1 = ratio * advantage
                 surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
                 actor_loss_total += -torch.min(surr1, surr2).mean()
+                # 熵正则化: 让策略保持多样性, 使流量分摊到多条路径 (负载均衡)
+                actor_loss_total -= self.entropy_coeff * dist.entropy().mean()
 
-        # --- 归一化总损失 ---
-        actor_loss = actor_loss_total / (self.num_dests * 2)
+            # ── 分流比例动作的 PPO 损失 (每目的地) ──────────────────────────────
+            split_probs = torch.softmax(split_logits[:, dest_index], dim=-1)
+            split_dist = torch.distributions.Categorical(split_probs)
+            split_logp = split_dist.log_prob(split_actions[:, dest_index])
+            old_split_logs = old_split_logprobs[:, dest_index]
+            split_ratio = torch.exp(split_logp - old_split_logs)
+            split_surr1 = split_ratio * advantage
+            split_surr2 = torch.clamp(split_ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
+            actor_loss_total += -torch.min(split_surr1, split_surr2).mean()
+            actor_loss_total -= self.entropy_coeff * split_dist.entropy().mean()
+
+        # --- 归一化总损失 (3 个动作头: 主路下一跳 + 备路下一跳 + 分流比例) ---
+        actor_loss = actor_loss_total / (self.num_dests * 3)
         critic_loss = critic_loss_total / self.num_dests
 
         # --- 执行反向传播 ---
