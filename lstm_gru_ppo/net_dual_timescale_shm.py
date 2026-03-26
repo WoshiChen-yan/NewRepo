@@ -6,8 +6,8 @@ import numpy as np
 
 from net import Net
 from ppoagent import SPLIT_WEIGHTS
-from ppoagent_dual_timescale import PPOAgentDualTimeScale
-from trend_shared_memory import TrendSharedMemory
+from lstm_gru_ppo.ppoagent_dual_timescale import PPOAgentDualTimeScale
+from lstm_gru_ppo.trend_shared_memory import TrendSharedMemory
 
 
 def _compute_trend_from_snapshot(snapshot_3d):

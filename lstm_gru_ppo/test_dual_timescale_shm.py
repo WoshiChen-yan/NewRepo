@@ -1,7 +1,7 @@
 import os
 import time
 
-from net_dual_timescale_shm import NetDualTimeScaleSHM
+from lstm_gru_ppo.net_dual_timescale_shm import NetDualTimeScaleSHM
 
 
 Net_1 = NetDualTimeScaleSHM(name='Net_1', interval=1, t_slow=1.0, t_fast=0.01)
