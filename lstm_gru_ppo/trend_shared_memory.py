@@ -5,6 +5,7 @@ from multiprocessing import shared_memory
 import numpy as np
 
 
+
 class TrendSharedMemory:
     """
     Shared memory layout:
@@ -52,6 +53,9 @@ class TrendSharedMemory:
         return seq, ts, conf, rows, cols
 
     def write_matrix(self, matrix, confidence=0.0):
+        # [Future TODO - commented design only]
+        # - Add monotonic timestamp source for cross-process clock robustness
+        # - Add confidence smoothing to avoid abrupt confidence jumps
         mat = np.asarray(matrix, dtype=np.float32)
         if mat.shape != (self.rows, self.cols):
             raise ValueError(f"matrix shape mismatch: got {mat.shape}, expect {(self.rows, self.cols)}")
@@ -71,6 +75,9 @@ class TrendSharedMemory:
         self._write_meta(start_seq + 1, time.time(), confidence, self.rows, self.cols)
 
     def read_matrix(self):
+        # [Future TODO - commented design only]
+        # - Implement bounded retry loop before returning stale/None
+        # - Add optional strict mode: raise on repeated metadata mismatch
         size = self.rows * self.cols * 4
         start = self.META_SIZE
         end = start + size

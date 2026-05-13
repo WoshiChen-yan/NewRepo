@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 
+
 class PPOActorTopKContinuous(nn.Module):
     def __init__(self, state_dim, num_dests, num_next_hops, gru_hidden_dim, top_k):
         super().__init__()
@@ -75,9 +76,68 @@ class PPOAgentTopKContinuous:
         valid = set(neighbor_map_indices or [])
         valid.discard(self_index)
         valid.discard(dest_index)
-        return sorted(valid)
+     # class FutureRiskAwareHopSelector(nn.Module):
+#     def __init__(self, num_next_hops, hidden_dim=64):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(num_next_hops + 3, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, num_next_hops),
+#         )
+#
+#     def forward(self, hop_probs, risk, loss, delay):
+#         x = torch.cat([hop_probs, risk, loss, delay], dim=-1)
+#         logits = self.net(x)
+#         return torch.softmax(logits, dim=-1)
+#
+# class FutureKLController:
+#     def __init__(self, target_kl=0.02, up=1.5, down=0.67):
+#         self.target_kl = float(target_kl)
+#         self.up = float(up)
+#         self.down = float(down)
+#
+#     def update_clip(self, current_kl, eps_clip):
+#         if current_kl > self.target_kl * 2.0:
+#             return max(0.05, eps_clip * self.down)
+#         if current_kl < self.target_kl * 0.5:
+#             return min(0.40, eps_clip * self.up)
+#         return eps_clip
+#
+# def future_compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+#     adv = torch.zeros_like(rewards)
+#     gae = 0.0
+#     for t in reversed(range(len(rewards))):
+#         delta = rewards[t] + gamma * values[t + 1] * (1.0 - dones[t]) - values[t]
+#         gae = delta + gamma * lam * (1.0 - dones[t]) * gae
+#         adv[t] = gae
+#     return adv
+#
+# def future_prioritized_sample(memory, priorities, batch_size):
+#     p = np.asarray(priorities, dtype=np.float64)
+#     p = np.clip(p, 1e-8, None)
+#     p = p / p.sum()
+#     idx = np.random.choice(len(memory), size=batch_size, replace=False, p=p)
+#     return [memory[i] for i in idx], idx
+#
+# class FutureActionSanitizer:
+#     def __init__(self, self_index):
+#         self.self_index = int(self_index)
+#
+#     def sanitize_hops(self, hops, max_hop_id):
+#         out = []
+#         for h in hops:
+#             if h < 0 or h >= max_hop_id or h == self.self_index:
+#                 out.append(self.self_index)
+#             else:
+#                 out.append(h)
+#         return out
+#
+# def future_entropy_schedule(step, e0=0.02, e1=0.001, warm=5000):
+#     r = min(1.0, max(0.0, step / float(warm)))
+#     return e0 * (1.0 - r) + e1 * r
 
     def select_action(self, state, self_index, neighbor_map_indices):
+       
         state_t = torch.FloatTensor(state).unsqueeze(0)
         hop_logits, dir_alpha = self.actor(state_t)
 
@@ -127,6 +187,13 @@ class PPOAgentTopKContinuous:
         self.memory.append(transition)
 
     def learn(self):
+        # [Future TODO - commented design only]
+        # - GAE(lambda):
+        #   adv_t = sum_{l>=0} (gamma*lambda)^l * delta_{t+l}
+        # - Trust-region style KL guard:
+        #   stop/update clipping if KL > target_kl
+        # - AMP mixed precision path:
+        #   use torch.cuda.amp for faster large-batch updates
         if len(self.memory) < self.batch_size:
             return
 
@@ -198,3 +265,4 @@ class PPOAgentTopKContinuous:
         critic_loss.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
         self.optimizerC.step()
+

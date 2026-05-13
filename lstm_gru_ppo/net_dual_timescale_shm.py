@@ -271,3 +271,5 @@ class NetDualTimeScaleSHM(Net):
 
         if trend_matrix is not None and epoch % 10 == 0:
             print(f"[FastStream] trend epoch={epoch}, age={age:.3f}s, alpha={alpha:.2f}")
+
+

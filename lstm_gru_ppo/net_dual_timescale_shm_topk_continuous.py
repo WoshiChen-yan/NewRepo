@@ -12,6 +12,8 @@ from lstm_gru_ppo.ppoagent_topk_continuous import PPOAgentTopKContinuous
 from lstm_gru_ppo.trend_shared_memory import TrendSharedMemory
 
 
+
+
 class TrendLSTM(nn.Module):
     def __init__(self, input_dim=3, hidden_dim=64, num_layers=1):
         super().__init__()
@@ -86,6 +88,10 @@ def _compute_trend_from_snapshot(snapshot_history, model, window_size):
 
 
 def _slow_predictor_worker(shm_name, n_nodes, input_queue, stop_event, lstm_window=12, lstm_ckpt_path=None):
+    # [Future TODO - commented design only]
+    # - Add adaptive batch inference over queued snapshots for CPU efficiency
+    # - Add periodic checkpoint auto-save for online fine-tuning
+    # - Add model A/B switch by control message in queue
     shm = TrendSharedMemory(name=shm_name, rows=n_nodes, cols=n_nodes, create=False)
     model = TrendLSTM(input_dim=3, hidden_dim=64, num_layers=1)
 
@@ -193,7 +199,51 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
             f"[SlowStream-LSTM] process started: pid={self._slow_process.pid}, "
             f"T_slow={self.T_slow}s, window={self.lstm_window}"
         )
-
+    # class FutureTransformerTrend(nn.Module):
+#     def __init__(self, input_dim=3, d_model=64, nhead=4, num_layers=2):
+#         super().__init__()
+#         self.proj = nn.Linear(input_dim, d_model)
+#         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+#         self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+#         self.head = nn.Sequential(nn.Linear(d_model, 32), nn.ReLU(), nn.Linear(32, 1), nn.Sigmoid())
+#
+#     def forward(self, x):
+#         z = self.proj(x)
+#         y = self.enc(z)
+#         return self.head(y[:, -1, :]).squeeze(-1)
+#
+# def future_build_multi_horizon_targets(snapshot_seq):
+#     # returns y1, y5, y10 placeholders
+#     n = snapshot_seq[-1].shape[0]
+#     y1 = np.zeros((n, n), dtype=np.float32)
+#     y5 = np.zeros((n, n), dtype=np.float32)
+#     y10 = np.zeros((n, n), dtype=np.float32)
+#     return y1, y5, y10
+#
+# class FutureRoutingChurnGuard:
+#     def __init__(self, max_churn_rate=0.25):
+#         self.max_churn_rate = float(max_churn_rate)
+#         self.prev_routes = {}
+#
+#     def accept(self, node_name, new_routes):
+#         old = self.prev_routes.get(node_name)
+#         self.prev_routes[node_name] = new_routes
+#         if old is None:
+#             return True
+#         changed = sum(1 for k in new_routes if old.get(k) != new_routes.get(k))
+#         churn = changed / max(1, len(new_routes))
+#         return churn <= self.max_churn_rate
+#
+# def future_emergency_fallback(core_node, default_nh):
+#     # core_node.cmd(f"ip route replace default via {default_nh} proto 188")
+#     pass
+#
+# def future_alloc_damp(new_alloc, old_alloc, rho=0.7):
+#     new_alloc = np.asarray(new_alloc, dtype=np.float32)
+#     old_alloc = np.asarray(old_alloc, dtype=np.float32)
+#     out = rho * old_alloc + (1.0 - rho) * new_alloc
+#     s = float(out.sum())
+#     return out / s if s > 1e-8 else new_alloc
     def stop_slow_predictor(self):
         if self._slow_stop_event is not None:
             self._slow_stop_event.set()
@@ -265,6 +315,10 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
         return out / s if s > 1e-8 else uni
 
     def update_routing(self):
+        # [Future TODO - commented design only]
+        # - Add route churn guardrail: block updates if churn > threshold
+        # - Add emergency fallback policy when trend freshness is too old
+        # - Add per-destination traffic-class weighting before blend
         self._submit_snapshot_if_due()
 
         all_actions = {}
@@ -392,3 +446,5 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
 
         if trend_matrix is not None and epoch % 10 == 0:
             print(f"[FastStream-TopK] trend epoch={epoch}, age={age:.3f}s, alpha={alpha:.2f}")
+
+

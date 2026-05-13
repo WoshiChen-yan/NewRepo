@@ -1,7 +1,7 @@
 import os
 import time
 
-from lstm_gru_ppo.net_dual_timescale_shm_topk_continuous import NetDualTimeScaleSHMTopKContinuous
+from net_dual_timescale_shm_topk_continuous import NetDualTimeScaleSHMTopKContinuous
 
 
 Net_1 = NetDualTimeScaleSHMTopKContinuous(name='Net_1', interval=1, t_slow=1.0, t_fast=0.01, top_k=3)
@@ -16,7 +16,7 @@ Net_1.start_network()
 
 print("=== 双时间尺度(共享内存) Top-K 连续分流测试开始 ===")
 
-training_steps = 15
+training_steps = 30
 last_iteration_time = Net_1.interval
 
 try:
@@ -54,3 +54,4 @@ except KeyboardInterrupt:
 finally:
     Net_1.stop_slow_predictor()
     Net_1.end_test()
+
