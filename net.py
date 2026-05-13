@@ -252,18 +252,19 @@ class Net:
     # --- (v5) 奖励计算 ---
     def _calculate_reward_from_link(self, link_info):
         if not link_info:
-            return -10.0 
+            return -5.0
         
-        latency = min(link_info.get('latency', 1000.0), 1000.0) 
+        latency = min(link_info.get('latency', 1000.0), 1000.0)
         loss = min(link_info.get('loss', 100.0), 100.0)
         throughput = min(link_info.get('throughput', 0.0), 100.0)  # Mbps, cap at 100
 
         lat_penalty = (latency / 100.0) * 5.0
         loss_penalty = (loss / 100.0) * 5.0
-        # 吞吐量奖励: 链路实际被使用时给正向激励 (最大 +2.0)
-        throughput_bonus = min(throughput / 50.0, 2.0)
+        # 吞吐量越高，代价越低，但奖励始终保持为负数
+        throughput_cost = max(0.0, 2.0 - min(throughput / 50.0, 2.0))
 
-        reward = 10.0 - lat_penalty - loss_penalty + throughput_bonus
+        cost = lat_penalty + loss_penalty + throughput_cost
+        reward = -max(0.01, cost)
         
         if latency >= 9999.0 or (loss == 100.0 and latency > 1000):
             return -5.0
