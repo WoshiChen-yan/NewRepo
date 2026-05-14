@@ -25,14 +25,14 @@ def make_ip(index):
     return f"10.10.{third}.{fourth}/24"
 
 
-def random_direction(max_speed=1.2):
+def random_direction(max_speed=1):
     # Keep mobility moderate to avoid overly unstable links in one step.
     dx = random.uniform(-max_speed, max_speed)
     dy = random.uniform(-max_speed, max_speed)
     return (round(dx, 2), round(dy, 2), 0.0)
 
 
-def random_position(xy_bound=200.0):
+def random_position(xy_bound=30.0):
     x = random.uniform(-xy_bound, xy_bound)
     y = random.uniform(-xy_bound, xy_bound)
     return (round(x, 1), round(y, 1), 0.0)
@@ -122,9 +122,12 @@ def print_final_report(net, total_elapsed, training_steps):
 
 
 def main():
-    random.seed(20260415)
+    random.seed(20260514)
 
-    num_nodes = 10
+    output_dir = PACKAGE_ROOT / "test"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    num_nodes = 5
     training_steps = 10
     core_rate = 0.30
     fast_window_sec = 1.0
@@ -144,7 +147,7 @@ def main():
         node_name = f"n{i + 1}"
         mac = make_mac(i + 1)
         ip = make_ip(i + 1)
-        pos = random_position(xy_bound=220.0)
+        pos = random_position()
 
         # 20% static nodes, 80% mobile nodes.
         if random.random() < 0.2:
@@ -153,8 +156,6 @@ def main():
             direction = random_direction(max_speed=1.0)
 
         net.add_node(name=node_name, mac=mac, ip=ip, position=pos, direction=direction)
-
-    os.makedirs("test", exist_ok=True)
 
     print_banner()
     print_config(
@@ -207,7 +208,7 @@ def main():
             print("平滑奖励序列   : " + ", ".join(f"{v:.3f}" for v in smoothed[-5:]))
 
         net.plot_all_nodes()
-        net.plot_reward_history(save_path="test/reward_history_lstm_random32.png")
+        net.plot_reward_history(save_path=str(output_dir / "reward_history_lstm_random32.png"))
 
     except KeyboardInterrupt:
         print("测试被用户中断")

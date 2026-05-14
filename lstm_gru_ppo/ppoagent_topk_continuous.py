@@ -76,70 +76,16 @@ class PPOAgentTopKContinuous:
         valid = set(neighbor_map_indices or [])
         valid.discard(self_index)
         valid.discard(dest_index)
-     # class FutureRiskAwareHopSelector(nn.Module):
-#     def __init__(self, num_next_hops, hidden_dim=64):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(num_next_hops + 3, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, num_next_hops),
-#         )
-#
-#     def forward(self, hop_probs, risk, loss, delay):
-#         x = torch.cat([hop_probs, risk, loss, delay], dim=-1)
-#         logits = self.net(x)
-#         return torch.softmax(logits, dim=-1)
-#
-# class FutureKLController:
-#     def __init__(self, target_kl=0.02, up=1.5, down=0.67):
-#         self.target_kl = float(target_kl)
-#         self.up = float(up)
-#         self.down = float(down)
-#
-#     def update_clip(self, current_kl, eps_clip):
-#         if current_kl > self.target_kl * 2.0:
-#             return max(0.05, eps_clip * self.down)
-#         if current_kl < self.target_kl * 0.5:
-#             return min(0.40, eps_clip * self.up)
-#         return eps_clip
-#
-# def future_compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-#     adv = torch.zeros_like(rewards)
-#     gae = 0.0
-#     for t in reversed(range(len(rewards))):
-#         delta = rewards[t] + gamma * values[t + 1] * (1.0 - dones[t]) - values[t]
-#         gae = delta + gamma * lam * (1.0 - dones[t]) * gae
-#         adv[t] = gae
-#     return adv
-#
-# def future_prioritized_sample(memory, priorities, batch_size):
-#     p = np.asarray(priorities, dtype=np.float64)
-#     p = np.clip(p, 1e-8, None)
-#     p = p / p.sum()
-#     idx = np.random.choice(len(memory), size=batch_size, replace=False, p=p)
-#     return [memory[i] for i in idx], idx
-#
-# class FutureActionSanitizer:
-#     def __init__(self, self_index):
-#         self.self_index = int(self_index)
-#
-#     def sanitize_hops(self, hops, max_hop_id):
-#         out = []
-#         for h in hops:
-#             if h < 0 or h >= max_hop_id or h == self.self_index:
-#                 out.append(self.self_index)
-#             else:
-#                 out.append(h)
-#         return out
-#
-# def future_entropy_schedule(step, e0=0.02, e1=0.001, warm=5000):
-#     r = min(1.0, max(0.0, step / float(warm)))
-#     return e0 * (1.0 - r) + e1 * r
+
 
     def select_action(self, state, self_index, neighbor_map_indices):
        
         state_t = torch.FloatTensor(state).unsqueeze(0)
         hop_logits, dir_alpha = self.actor(state_t)
+        # Guard against NaNs/Infs coming from upstream state
+        hop_logits = torch.nan_to_num(hop_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        dir_alpha = torch.nan_to_num(dir_alpha, nan=1.0, posinf=1.0, neginf=1.0)
+        dir_alpha = dir_alpha.clamp_min(1e-6)
 
         selected_hops = []
         split_allocs = []
@@ -149,16 +95,17 @@ class PPOAgentTopKContinuous:
         eps = 1e-6
 
         for d in range(self.num_dests):
+            # 1. 获取有效下一跳集合
             valid = self._valid_hops(self_index, neighbor_map_indices, d)
             logits = hop_logits[0, d].clone()
-
+            # 2. 处理无有效下一跳的情况
             if not valid:
                 selected_hops.append([self_index] * self.top_k)
                 split_allocs.append([1.0 / self.top_k] * self.top_k)
                 hop_logps.append(-1e9)
                 alloc_logps.append(-1e9)
                 continue
-
+            # 3. Masked Softmax：只考虑有效下一跳
             mask = torch.full_like(logits, -torch.inf)
             mask[torch.LongTensor(valid)] = 0.0
             probs = torch.softmax(logits + mask, dim=-1)
@@ -171,14 +118,15 @@ class PPOAgentTopKContinuous:
 
             idx_list = [int(x.item()) for x in top_idx]
             selected_hops.append(idx_list)
-
+            # 4. 计算下一跳的log概率
             hop_lp = float(torch.log(probs.clamp(eps, 1.0)[top_idx]).sum().item())
             hop_logps.append(hop_lp)
-
+            # 5. 计算分配的log概率
             dist = torch.distributions.Dirichlet(dir_alpha[0, d])
             alloc = dist.sample().clamp(eps, 1.0)
             alloc = alloc / alloc.sum()
             split_allocs.append([float(x.item()) for x in alloc])
+            # 6. 计算分配的log概率
             alloc_logps.append(float(dist.log_prob(alloc).item()))
 
         return selected_hops, split_allocs, hop_logps, alloc_logps
@@ -187,14 +135,9 @@ class PPOAgentTopKContinuous:
         self.memory.append(transition)
 
     def learn(self):
-        # [Future TODO - commented design only]
-        # - GAE(lambda):
-        #   adv_t = sum_{l>=0} (gamma*lambda)^l * delta_{t+l}
-        # - Trust-region style KL guard:
-        #   stop/update clipping if KL > target_kl
-        # - AMP mixed precision path:
-        #   use torch.cuda.amp for faster large-batch updates
+
         if len(self.memory) < self.batch_size:
+            print(f"Memory size {len(self.memory)} is less than batch size {self.batch_size}, skip learning")
             return
 
         batch = random.sample(self.memory, self.batch_size)
@@ -214,11 +157,18 @@ class PPOAgentTopKContinuous:
         selected_hops_t = torch.LongTensor(np.array(selected_hops))
         split_allocs_t = torch.FloatTensor(np.array(split_allocs))
         rewards_t = torch.FloatTensor(np.array(rewards_list))
+        # Sanitize NaNs/Infs before forward pass
+        states_t = torch.nan_to_num(states_t, nan=0.0, posinf=0.0, neginf=0.0)
+        next_states_t = torch.nan_to_num(next_states_t, nan=0.0, posinf=0.0, neginf=0.0)
+        rewards_t = torch.nan_to_num(rewards_t, nan=0.0, posinf=0.0, neginf=0.0)
         old_hop_lp_t = torch.FloatTensor(np.array(old_hop_logps))
         old_alloc_lp_t = torch.FloatTensor(np.array(old_alloc_logps))
         dones_t = torch.FloatTensor(np.array(dones)).unsqueeze(1)
 
         hop_logits, dir_alpha = self.actor(states_t)
+        hop_logits = torch.nan_to_num(hop_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        dir_alpha = torch.nan_to_num(dir_alpha, nan=1.0, posinf=1.0, neginf=1.0)
+        dir_alpha = dir_alpha.clamp_min(1e-6)
 
         actor_loss_total = 0.0
         critic_loss_total = 0.0

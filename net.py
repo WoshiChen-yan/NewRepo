@@ -264,7 +264,7 @@ class Net:
         throughput_cost = max(0.0, 2.0 - min(throughput / 50.0, 2.0))
 
         cost = lat_penalty + loss_penalty + throughput_cost
-        reward = -max(0.01, cost)
+        reward = -max(0.01, cost) * 40
         
         if latency >= 9999.0 or (loss == 100.0 and latency > 1000):
             return -5.0
@@ -388,7 +388,7 @@ class Net:
             if node in self.core_nodes and rewards_list:
                 current_step_core_rewards.append(np.mean(rewards_list))
 
-        # --- 步骤 5: 触发全局学习 (v0.2.0 优化: 只学习核心节点) ---
+        # --- 步骤 5: 触发全局学习 (只学习核心节点) ---
         if self.global_steps > self.batch_size: 
             if self.global_steps % 10 == 0: 
                 print(f"\n--- [全局学习步骤 {self.global_steps} (仅核心节点)] ---")
@@ -408,6 +408,7 @@ class Net:
             avg_reward = np.mean(current_step_core_rewards)
             self.avg_core_reward_history.append(avg_reward)
             
+            avg_reward = avg_reward/40 
             if avg_reward < self.reelection_trigger_threshold:
                 self.bad_network_health_counter += 1
                 print(f"  [健康检查] 网络平均奖励 {avg_reward:.2f} (低于 {self.reelection_trigger_threshold}), 差评计数: {self.bad_network_health_counter}/{self.reelection_patience}")
@@ -628,14 +629,6 @@ class Net:
                 print(f"已为节点 {name} 创建 PPOAgent (Actor)")
          
                     
-    def validate_agent_performance(self, episodes=3):
-        # ... (此函数无需修改, 但请注意它仍在调用旧的 apply_node_routing) ...
-        # ... (您可能需要更新此函数以反映新的动作空间) ...
-        pass
-
-    def _get_current_path(self, src, dst):
-        # ... (此函数无需修改) ...
-        pass
         
     def start_wmediumd_inbackground(self, config_path='test.cfg'):
         """
