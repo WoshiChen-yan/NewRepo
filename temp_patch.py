@@ -1,4 +1,4 @@
-# 在 get_link_quality_by_mac 之前插入新方法
+
 
 new_method = '''    def update_link_quality_cache(self, target_mac, latency=None, loss=None, rssi=None, bitrate=None):
         """

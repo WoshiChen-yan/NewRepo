@@ -142,7 +142,7 @@ def main():
         lstm_ckpt_path=None,
     )
 
-    # Build random topology with 32 nodes.
+    # Build random topology with nodes.
     for i in range(num_nodes):
         node_name = f"n{i + 1}"
         mac = make_mac(i + 1)
@@ -181,15 +181,15 @@ def main():
                 f"topology -> slow LSTM -> GRU/PPO -> routing -> learning ---"
             )
 
-            # Dynamic topology evolution.
+            
             net.move_nodes(last_iteration_time)
 
-            # Re-elect core nodes periodically.
+            
             if step % net.agent_migration_interval == 0 or step == 0:
                 net.test_all_links_concurrent()
                 net.select_core_nodes(num_nodes_rate=core_rate)
 
-            # Fast stream scheduling window.
+            
             fast_begin = time.time()
             while time.time() - fast_begin < fast_window_sec:
                 net.test_all_links_concurrent()

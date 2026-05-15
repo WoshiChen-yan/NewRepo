@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-"""
-贪心路由算法测试文件
 
-该脚本创建一个无线网络拓扑，并实现基于链路质量的贪心路由算法，
-然后与现有路由算法进行性能比较。
-"""
 
 from net import Net
 import time

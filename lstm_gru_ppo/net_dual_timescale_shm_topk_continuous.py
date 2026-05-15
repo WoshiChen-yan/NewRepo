@@ -18,7 +18,7 @@ from lstm_gru_ppo.trend_shared_memory import TrendSharedMemory
 
 
 class TrendLSTM(nn.Module):
-    """趋势预测LSTM模型 - 用于预测网络链路风险概率"""
+    """慢周期  趋势预测LSTM模型 - 用于预测网络链路风险概率"""
     def __init__(self, input_dim=3, hidden_dim=64, num_layers=1):
         super().__init__()
         # LSTM层：输入维度3(RSSI, loss, latency)，隐藏层维度64
@@ -47,6 +47,7 @@ def _normalize_snapshot(snapshot_3d):
     rssi = snap[:, :, 0]      # 接收信号强度
     loss = snap[:, :, 1]      # 丢包率
     latency = snap[:, :, 2]   # 延迟
+    link_utilization = snap[:, :, 3] if snap.shape[2] > 3 else None  # 链路利用率（如果存在）
 
     # RSSI归一化：-100dBm→1(最差), -50dBm→0(最好)
     out[:, :, 0] = np.clip((-rssi - 50.0) / 50.0, 0.0, 1.0)
@@ -54,6 +55,9 @@ def _normalize_snapshot(snapshot_3d):
     out[:, :, 1] = np.clip(loss / 100.0, 0.0, 1.0)
     # 延迟归一化：0ms→0, 300ms→1
     out[:, :, 2] = np.clip(latency / 300.0, 0.0, 1.0)
+    # 链路利用率归一化：0%→0, 100%→1
+    if link_utilization is not None:
+        out[:, :, 3] = np.clip(link_utilization / 100.0, 0.0, 1.0)
 
     # 将NaN值设为1(最高风险)
     out[np.isnan(out)] = 1.0
@@ -93,7 +97,7 @@ def _compute_trend_from_snapshot(snapshot_history, model, window_size):
     if x is None:
         return None
 
-    # 模型评估模式，禁用梯度计算
+    # 模型评估模式
     model.eval()
     with torch.no_grad():
         pred = model(x).cpu().numpy().reshape(n, n).astype(np.float32)
@@ -115,7 +119,7 @@ def _slow_predictor_worker(shm_name, n_nodes, input_queue, stop_event, lstm_wind
     # 初始化趋势预测LSTM模型
     model = TrendLSTM(input_dim=3, hidden_dim=64, num_layers=1)
 
-    # 加载预训练模型权重（如果提供）
+    # 加载预训练模型权重
     if lstm_ckpt_path:
         try:
             ckpt = torch.load(lstm_ckpt_path, map_location="cpu")
@@ -228,7 +232,7 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
         self._trend_shm = TrendSharedMemory(name=self._shm_name, rows=n, cols=n, create=True)
 
         # 创建进程间通信队列
-        self._slow_queue = mp.Queue(maxsize=2)
+        self._slow_queue = mp.Queue(maxsize=2)  # 限制队列大小以防止内存积压
         # 创建停止事件
         self._slow_stop_event = mp.Event()
         # 创建并启动慢流预测进程
@@ -299,6 +303,9 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
                 snapshot[i, j, 0] = float(info.get("rssi", -100.0))
                 snapshot[i, j, 1] = float(info.get("loss", 100.0))
                 snapshot[i, j, 2] = float(info.get("latency", 1000.0))
+                # 填充链路利用率（如果存在）
+                if "link_utilization" in info:
+                    snapshot[i, j, 3] = float(info["link_utilization"])
         return snapshot
 
     def _submit_snapshot_if_due(self):
@@ -360,6 +367,7 @@ class NetDualTimeScaleSHMTopKContinuous(Net):
         3. 应用路由配置到实际网络
         4. 收集奖励并训练PPO智能体
         """
+        
         # [Future TODO - 设计思路]
         # - 添加路由抖动保护：当链路变化超过阈值时阻止更新
         # - 添加紧急回退策略：当趋势新鲜度过旧时使用默认路由
